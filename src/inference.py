@@ -8,8 +8,8 @@ Input:  Binary lesion mask in SUIT space (NIfTI, 3D)
 Output: 1D array of disruption probabilities, one per cortical parcel
 
 Aggregation methods:
-  - max:                maximum pathway occupancy across lesion voxels
-  - mean:              average pathway occupancy across lesion voxels
+  - mean (default):    average pathway occupancy across lesion voxels
+  - max:               maximum pathway occupancy across lesion voxels
   - weighted_sum:      sum of occupancy values, normalized to [0, 1]
   - threshold_fraction: fraction of pathway volume intersected (threshold > 0.1)
 
@@ -41,9 +41,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 # ---------------------------------------------------------------------------
 
 DEFAULT_OCCUPANCY_PATH = DATA_FINAL / "pathway_occupancy_4d.nii.gz"
-DEFAULT_PARCELLATION_PATH = DATA_FINAL / "cortical_parcellation_SUIT.nii.gz"
-DEFAULT_REFERENCE_PATH = DATA_FINAL / "SUIT_reference.nii.gz"
-DEFAULT_METADATA_PATH = DATA_FINAL / "parcel_metadata.json"
+DEFAULT_METADATA_PATH = DATA_FINAL / "pathway_occupancy_metadata.json"
 
 # Occupancy threshold for the 'threshold_fraction' method
 _THRESHOLD_FRACTION_CUTOFF = 0.1
@@ -59,7 +57,7 @@ VALID_METHODS = ("max", "mean", "weighted_sum", "threshold_fraction")
 def infer_disruption(
     lesion_path: str | Path,
     occupancy_path: str | Path,
-    method: str = "max",
+    method: str = "mean",
 ) -> np.ndarray:
     """
     Compute parcel-wise cortical disruption from a cerebellar lesion mask.
@@ -330,8 +328,6 @@ def run_inference(
             )
 
     occupancy_path = DEFAULT_OCCUPANCY_PATH
-    parcellation_path = DEFAULT_PARCELLATION_PATH
-    reference_path = DEFAULT_REFERENCE_PATH
     metadata_path = DEFAULT_METADATA_PATH
 
     logger.info("=" * 60)
@@ -339,7 +335,6 @@ def run_inference(
     logger.info("=" * 60)
     logger.info("Lesion mask:   %s", lesion_path)
     logger.info("Occupancy:     %s", occupancy_path)
-    logger.info("Parcellation:  %s", parcellation_path)
     logger.info("Methods:       %s", methods)
 
     results = {}
@@ -356,21 +351,7 @@ def run_inference(
         output_dir.mkdir(parents=True, exist_ok=True)
         lesion_stem = lesion_path.stem.replace(".nii", "")
 
-        for method, disruption in results.items():
-            # Save disruption volume
-            vol_path = output_dir / f"{lesion_stem}_disruption_{method}.nii.gz"
-            try:
-                img = disruption_to_volume(
-                    disruption, parcellation_path, reference_path,
-                )
-                nib.save(img, str(vol_path))
-                logger.info("Saved disruption volume: %s", vol_path)
-            except FileNotFoundError as exc:
-                logger.warning(
-                    "Could not save disruption volume for '%s': %s", method, exc,
-                )
-
-        # Save summary CSV (use the first method for the summary, then add all)
+        # Save summary CSV
         try:
             summary_frames = []
             for method, disruption in results.items():

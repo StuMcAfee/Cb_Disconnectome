@@ -7,28 +7,27 @@ product of the cerebellar disconnectome model.
 
 Pipeline
 --------
-1. Build a subdivided parcellation by splitting each SUIT lobule into five
-   medial-lateral zones (vermis, paravermis_L, paravermis_R, hemisphere_L,
-   hemisphere_R), yielding roughly 60-80 parcels.
+1. Load the native SUIT lobular parcellation (28 cortical labels at 1 mm
+   isotropic resolution).
 2. Load the cortico-nuclear probability map (from Step 1) and compute each
    parcel's average nuclear-target probability vector.
 3. Load the nuclear efferent density maps (from Step 2).
-4. For each parcel k:
+4. For each parcel k (one per SUIT atlas label, 28 total):
        a. Weight the nuclear efferent density maps by parcel k's projection
           probabilities.
        b. Add the cortical voxels of parcel k as a "direct injury" zone
           (probability = 1.0).
        c. Store the resulting 3D map as volume k of the 4D output.
 
-Output shape: (X, Y, Z, N_parcels)
+Output shape: (X, Y, Z, 28)
 Each 3D volume represents the probability that a lesion at voxel (x, y, z)
-disrupts cortical parcel k.
+disrupts cortical parcel k.  Resolution matches the native SUIT atlas (1 mm
+isotropic).
 
 Outputs
 -------
-- data/final/pathway_occupancy_4d.nii.gz         — main 4D volume
-- data/final/parcellation_subdivided_SUIT.nii.gz  — subdivided parcellation
-- data/final/pathway_occupancy_metadata.json      — JSON metadata sidecar
+- data/final/pathway_occupancy_4d.nii.gz       — main 4D volume
+- data/final/pathway_occupancy_metadata.json    — JSON metadata sidecar
 
 Usage:
     python -m src.build_4d_nifti [--config config.json]
@@ -47,9 +46,7 @@ from src.utils import (
     ATLAS_DIR,
     DATA_FINAL,
     DATA_INTERIM,
-    classify_zones,
     get_config,
-    get_mm_coordinate_grid,
     load_nifti,
     save_metadata,
     save_nifti,
@@ -62,17 +59,10 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 NUCLEUS_NAMES = ["fastigial", "emboliform", "globose", "dentate"]
 N_NUCLEI = len(NUCLEUS_NAMES)
 
-# Standard SUIT lobule names used for parcellation.  The ordering follows the
-# Diedrichsen cerebellar atlas convention.
-SUIT_LOBULE_NAMES = [
-    "I-IV", "V", "VI", "CrusI", "CrusII",
-    "VIIb", "VIIIa", "VIIIb", "IX", "X",
-]
-
-# Default label-to-lobule mapping for the SUIT anatomical atlas.
-# Keys are integer labels in the atlas NIfTI; values are (lobule, side) tuples
-# where side is 'L', 'R', or 'V' (vermis).
-# Labels 29-34 are deep nuclei and are excluded from cortical parcellation.
+# Default label-to-name mapping for the 28 cortical labels in the SUIT
+# anatomical atlas.  Labels 29-34 are deep nuclei and are excluded.
+# Keys are the integer labels in the atlas NIfTI; values are (lobule, side)
+# tuples where side is 'L', 'R', or 'V' (vermis).
 DEFAULT_SUIT_LABELS: dict[int, tuple[str, str]] = {
     1:  ("I-IV",   "L"),
     2:  ("I-IV",   "R"),
@@ -104,9 +94,11 @@ DEFAULT_SUIT_LABELS: dict[int, tuple[str, str]] = {
     28: ("X",      "R"),
 }
 
+N_CORTICAL_PARCELS = len(DEFAULT_SUIT_LABELS)  # 28
+
 
 # ---------------------------------------------------------------------------
-# Subdivided parcellation
+# SUIT parcellation loader
 # ---------------------------------------------------------------------------
 
 def _load_suit_parcellation(config: dict) -> tuple[np.ndarray, np.ndarray, nib.Nifti1Header]:
@@ -126,172 +118,62 @@ def _load_suit_parcellation(config: dict) -> tuple[np.ndarray, np.ndarray, nib.N
     return load_nifti(parc_path, dtype=int)
 
 
-def build_subdivided_parcellation(
+def load_parcellation(
     config: dict | None = None,
-) -> tuple[np.ndarray, list[dict]]:
+) -> tuple[np.ndarray, list[dict], np.ndarray]:
     """
-    Create the subdivided parcellation from SUIT lobular atlas + zone
-    classification.
+    Load the native SUIT lobular parcellation and build a parcel info list.
 
-    Each SUIT lobule is split into up to five medial-lateral subdivisions:
-        vermis, paravermis_L, paravermis_R, hemisphere_L, hemisphere_R
-
-    The subdivision uses soft (sigmoid) zone weights and assigns each voxel
-    to the zone with the highest membership weight.  Voxels that originally
-    belong to left-lateralised SUIT labels keep their left side; similarly
-    for right.  Vermis labels can be split into all five zones.
+    Uses the 28 cortical labels from the SUIT anatomical atlas directly,
+    preserving the native 1 mm isotropic resolution.
 
     Parameters
     ----------
     config : dict, optional
-        Model configuration overrides (zone boundary parameters).
+        Model configuration overrides.
 
     Returns
     -------
-    parcellation_data : np.ndarray of shape (X, Y, Z), dtype int32
-        Integer label volume where each unique nonzero value corresponds
-        to one subdivided parcel.
+    parcellation_data : np.ndarray of shape (X, Y, Z), dtype int
+        Integer label volume (labels 1-28 for cortex, 0 for background).
+        Deep nuclei labels (29-34) are set to 0.
     parcel_info_list : list of dict
-        One entry per parcel with keys:
-        'index'      — integer label in parcellation_data (1-based)
-        'name'       — human-readable parcel name (e.g. "CrusI_hemisphere_L")
+        One entry per cortical parcel (28 entries) with keys:
+        'index'      — integer label in parcellation_data (1-28)
+        'name'       — human-readable parcel name (e.g. "Left_CrusI")
         'lobule'     — SUIT lobule name
-        'zone'       — one of 'vermis', 'paravermis', 'hemisphere'
-        'hemisphere' — 'L', 'R', or 'midline'
+        'hemisphere' — 'L', 'R', or 'V'
+    affine : np.ndarray of shape (4, 4)
+        Affine matrix of the parcellation volume.
     """
     cfg = get_config(config)
     parc_data, affine, header = _load_suit_parcellation(cfg)
-    shape = parc_data.shape[:3]
 
-    # Build mm coordinate grid to classify medial-lateral zones
-    mm_grid = get_mm_coordinate_grid(shape, affine)
-    x_mm = mm_grid[..., 0]  # medial-lateral axis in SUIT space
+    # Zero out deep nuclei labels (29-34) so only cortical labels remain
+    parc_data[parc_data > N_CORTICAL_PARCELS] = 0
 
-    # Soft zone membership weights
-    zone_weights = classify_zones(x_mm, cfg)
-
-    # Determine hemisphere from sign of x (SUIT: negative = right, positive = left
-    # by neurological convention, but the atlas labels already encode side).
-    # We use x_mm sign to split vermis labels and to assign paravermis/hemisphere
-    # side for lateralised labels.
-    is_left = x_mm >= 0  # SUIT convention: x >= 0 is anatomical left
-
-    # Zone definitions for subdivision
-    # For each zone type we record (zone_name_prefix, hemisphere_label)
-    ZONE_DEFS = [
-        ("vermis",      "midline"),
-        ("paravermis_L", "L"),
-        ("paravermis_R", "R"),
-        ("hemisphere_L", "L"),
-        ("hemisphere_R", "R"),
-    ]
-
-    # Allocate output
-    subdiv_data = np.zeros(shape, dtype=np.int32)
     parcel_info_list: list[dict] = []
-    parcel_idx = 0  # will be incremented to 1-based
-
     for lbl_int, (lobule, side) in sorted(DEFAULT_SUIT_LABELS.items()):
-        lbl_mask = parc_data == lbl_int
-        if not lbl_mask.any():
-            continue
+        side_prefix = {"L": "Left", "R": "Right", "V": "Vermis"}[side]
+        parcel_name = f"{side_prefix}_{lobule}"
+        n_voxels = int((parc_data == lbl_int).sum())
 
-        # Determine which zones are valid for this label based on its side.
-        # - 'V' (vermis) labels can become: vermis, paravermis_L/R
-        # - 'L' labels can become: vermis (near midline), paravermis_L, hemisphere_L
-        # - 'R' labels can become: vermis (near midline), paravermis_R, hemisphere_R
-        for zone_name, hemi_label in ZONE_DEFS:
-            # Determine the zone weight array for this subdivision
-            if zone_name == "vermis":
-                zone_w = zone_weights["vermis"]
-            elif zone_name.startswith("paravermis"):
-                zone_w = zone_weights["paravermis"]
-            else:  # hemisphere
-                zone_w = zone_weights["lateral"]
-
-            # Determine side constraint
-            if zone_name.endswith("_L"):
-                side_mask = is_left
-            elif zone_name.endswith("_R"):
-                side_mask = ~is_left
-            else:
-                # vermis — no side constraint
-                side_mask = np.ones(shape, dtype=bool)
-
-            # Filter by original atlas label side compatibility
-            if side == "L" and hemi_label == "R":
-                continue  # left atlas label cannot produce right-side parcels
-            if side == "R" and hemi_label == "L":
-                continue  # right atlas label cannot produce left-side parcels
-            if side == "L" and hemi_label == "midline":
-                # Left label can contribute to vermis only for voxels near midline
-                pass
-            if side == "R" and hemi_label == "midline":
-                pass
-            if side == "V" and hemi_label in ("L", "R"):
-                # Vermis label can extend into paravermis on either side
-                pass
-
-            # The candidate voxels are those in the atlas label AND on the
-            # correct side AND where the zone weight is the dominant zone.
-            candidate = lbl_mask & side_mask
-
-            if not candidate.any():
-                continue
-
-            # Use winner-take-all among the three basic zones (vermis,
-            # paravermis, lateral) to assign each voxel to exactly one zone.
-            # Then intersect with the side constraint.
-            if zone_name == "vermis":
-                winner_mask = (
-                    (zone_weights["vermis"] >= zone_weights["paravermis"])
-                    & (zone_weights["vermis"] >= zone_weights["lateral"])
-                )
-            elif zone_name.startswith("paravermis"):
-                winner_mask = (
-                    (zone_weights["paravermis"] > zone_weights["vermis"])
-                    & (zone_weights["paravermis"] >= zone_weights["lateral"])
-                )
-            else:
-                winner_mask = (
-                    (zone_weights["lateral"] > zone_weights["vermis"])
-                    & (zone_weights["lateral"] > zone_weights["paravermis"])
-                )
-
-            final_mask = candidate & winner_mask
-            if not final_mask.any():
-                continue
-
-            parcel_idx += 1
-            subdiv_data[final_mask] = parcel_idx
-
-            parcel_name = f"{lobule}_{zone_name}"
-            zone_base = zone_name.split("_")[0]  # vermis / paravermis / hemisphere
-            parcel_info_list.append({
-                "index": parcel_idx,
-                "name": parcel_name,
-                "lobule": lobule,
-                "zone": zone_base,
-                "hemisphere": hemi_label,
-            })
-
-            n_voxels = int(final_mask.sum())
-            logger.info(
-                "  Parcel %3d: %-28s  (%d voxels)",
-                parcel_idx, parcel_name, n_voxels,
-            )
+        parcel_info_list.append({
+            "index": lbl_int,
+            "name": parcel_name,
+            "lobule": lobule,
+            "hemisphere": side,
+        })
+        logger.info(
+            "  Parcel %2d: %-20s  (%d voxels)", lbl_int, parcel_name, n_voxels,
+        )
 
     logger.info(
-        "Subdivided parcellation complete: %d parcels from %d lobule labels.",
-        parcel_idx, len(DEFAULT_SUIT_LABELS),
+        "Loaded SUIT parcellation: %d cortical parcels at %s resolution.",
+        len(parcel_info_list), parc_data.shape[:3],
     )
 
-    # Save the subdivided parcellation NIfTI
-    out_path = DATA_FINAL / "parcellation_subdivided_SUIT.nii.gz"
-    save_nifti(subdiv_data.astype(np.int32), affine, out_path)
-    logger.info("Saved subdivided parcellation: %s", out_path)
-
-    return subdiv_data, parcel_info_list
+    return parc_data, parcel_info_list, affine
 
 
 # ---------------------------------------------------------------------------
@@ -369,7 +251,7 @@ def save_parcellation_metadata(
     Parameters
     ----------
     parcel_info : list of dict
-        As returned by ``build_subdivided_parcellation``.
+        As returned by ``load_parcellation``.
     nuclear_probs : np.ndarray of shape (N_parcels, 4)
         Nuclear target probability vectors for each parcel.
     output_path : str or Path
@@ -378,13 +260,11 @@ def save_parcellation_metadata(
     parcels_meta = []
     for i, info in enumerate(parcel_info):
         probs = nuclear_probs[i]
-        # Determine primary nucleus target
         primary_idx = int(np.argmax(probs))
         parcels_meta.append({
             "index": info["index"],
             "name": info["name"],
             "lobule": info["lobule"],
-            "zone": info["zone"],
             "hemisphere": info["hemisphere"],
             "nucleus_target": NUCLEUS_NAMES[primary_idx],
             "projection_prob": {
@@ -401,9 +281,13 @@ def save_parcellation_metadata(
             "efferent output of the corresponding cortical parcel."
         ),
         "space": "SUIT",
+        "resolution": "1 mm isotropic (native SUIT atlas)",
         "dimensions": {
             "spatial": "X, Y, Z in SUIT template space",
-            "fourth": "N_parcels — one volume per subdivided cortical parcel",
+            "fourth": (
+                f"{N_CORTICAL_PARCELS} volumes — one per native SUIT "
+                "lobular label (labels 1-28)"
+            ),
         },
         "parcels": parcels_meta,
         "assumptions_reference": "docs/assumptions.md",
@@ -504,7 +388,8 @@ def build_pathway_occupancy_4d(
     """
     Build and save the full 4D pathway occupancy volume.
 
-    This is the main integration function.  For each cortical parcel k it:
+    Uses the 28 native SUIT lobular labels as parcels (1 mm isotropic).
+    For each cortical parcel k it:
       1. Looks up which nuclei parcel k projects to (from the cortico-nuclear
          map computed in Step 1).
       2. Weights the nuclear efferent density maps (from Step 2) by parcel k's
@@ -525,16 +410,16 @@ def build_pathway_occupancy_4d(
     cfg = get_config(config)
 
     # ------------------------------------------------------------------
-    # Step A: Build (or load) the subdivided parcellation
+    # Step A: Load the native SUIT parcellation (28 cortical labels)
     # ------------------------------------------------------------------
     logger.info("=" * 60)
-    logger.info("Step A: Building subdivided parcellation")
+    logger.info("Step A: Loading SUIT parcellation (28 cortical parcels)")
     logger.info("=" * 60)
-    parcellation_data, parcel_info = build_subdivided_parcellation(cfg)
+    parcellation_data, parcel_info, parc_affine = load_parcellation(cfg)
 
     n_parcels = len(parcel_info)
     if n_parcels == 0:
-        raise RuntimeError("No parcels were created.  Check atlas data.")
+        raise RuntimeError("No parcels were loaded.  Check atlas data.")
 
     # ------------------------------------------------------------------
     # Step B: Load the cortico-nuclear probability map (Step 1 output)
@@ -586,7 +471,7 @@ def build_pathway_occupancy_4d(
         parcel_mask = parcellation_data == parcel_label
 
         logger.info(
-            "  Parcel %3d / %d: %-28s  (%d cortical voxels)",
+            "  Parcel %3d / %d: %-20s  (%d cortical voxels)",
             i + 1, n_parcels, parcel_name, int(parcel_mask.sum()),
         )
 
@@ -612,7 +497,6 @@ def build_pathway_occupancy_4d(
 
         occupancy_4d[..., i] = weighted_efferent
 
-    # Final type enforcement
     occupancy_4d = occupancy_4d.astype(np.float32)
 
     # ------------------------------------------------------------------

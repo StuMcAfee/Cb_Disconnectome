@@ -26,7 +26,8 @@ Test cases
    disruption must be identically zero.
 
 For each test, inference is run with all four aggregation methods:
-``max``, ``mean``, ``weighted_sum``, ``threshold_fraction``.
+``mean``, ``max``, ``weighted_sum``, ``threshold_fraction``.
+The ``mean`` method is the default and is used for the primary evaluation.
 
 Outputs
 -------
@@ -78,7 +79,7 @@ logging.basicConfig(
 # Inference methods (self-contained fallback)
 # ───────────────────────────────────────────────────────────────────────
 
-INFERENCE_METHODS = ["max", "mean", "weighted_sum", "threshold_fraction"]
+INFERENCE_METHODS = ["mean", "max", "weighted_sum", "threshold_fraction"]
 
 
 def _try_import_inference():
@@ -160,7 +161,7 @@ def _fallback_inference(
     ----------
     lesion_data : (X, Y, Z) binary mask
     vol_4d : (X, Y, Z, N) pathway occupancy
-    method : one of 'max', 'mean', 'weighted_sum', 'threshold_fraction'
+    method : one of 'mean', 'max', 'weighted_sum', 'threshold_fraction'
     threshold : for threshold_fraction method
 
     Returns
@@ -188,7 +189,7 @@ def _fallback_inference(
         elif method == "threshold_fraction":
             scores[p] = float((vals >= threshold).sum() / max(vals.size, 1))
         else:
-            scores[p] = float(vals.max())
+            scores[p] = float(vals.mean())
 
     return scores
 
@@ -519,8 +520,8 @@ def main() -> None:
 
             print(f"  Method={method:20s}  sum={scores.sum():.3f}  max={scores.max():.4f}")
 
-            # Evaluate only for the 'max' method (primary)
-            if method == "max":
+            # Evaluate only for the 'mean' method (primary/default)
+            if method == "mean":
                 eval_result = _evaluate_test(tc, scores, label_names, cortical_labels)
                 all_results.append(eval_result)
                 print(f"  -> {eval_result['status']}: {eval_result['detail']}")

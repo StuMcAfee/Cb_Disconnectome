@@ -117,7 +117,7 @@ class TestInferDisruption:
     ):
         """An empty lesion (all zeros) should return all-zero disruption."""
         result = infer_disruption(
-            occupancy_nifti, empty_lesion_nifti, method="max"
+            empty_lesion_nifti, occupancy_nifti, method="max"
         )
         np.testing.assert_allclose(result, 0.0)
 
@@ -136,7 +136,7 @@ class TestInferDisruption:
           parcel 4: 0.0
         """
         result = infer_disruption(
-            occupancy_nifti, single_voxel_lesion_nifti, method="max"
+            single_voxel_lesion_nifti, occupancy_nifti, method="max"
         )
         expected = np.array([1.0, 1.0, 1.0, 0.5, 0.0])
         np.testing.assert_allclose(result, expected, atol=1e-6)
@@ -153,7 +153,7 @@ class TestInferDisruption:
         mean = (7+8+9) / (3*9) = 24/27 = 8/9 ~ 0.8889
         """
         result = infer_disruption(
-            occupancy_nifti, block_lesion_nifti, method="mean"
+            block_lesion_nifti, occupancy_nifti, method="mean"
         )
 
         assert result.shape == (N_PARCELS,)
@@ -178,7 +178,7 @@ class TestInferDisruption:
         then normalizes so the result falls in [0, 1].
         """
         result = infer_disruption(
-            occupancy_nifti, block_lesion_nifti, method="weighted_sum"
+            block_lesion_nifti, occupancy_nifti, method="weighted_sum"
         )
 
         assert result.shape == (N_PARCELS,)
@@ -202,7 +202,7 @@ class TestInferDisruption:
         occupancy > 0 in the whole volume.
         """
         result = infer_disruption(
-            occupancy_nifti, block_lesion_nifti, method="threshold_fraction"
+            block_lesion_nifti, occupancy_nifti, method="threshold_fraction"
         )
 
         assert result.shape == (N_PARCELS,)
@@ -224,7 +224,7 @@ class TestInferDisruption:
     ):
         """Output shape should match the number of parcels."""
         result = infer_disruption(
-            occupancy_nifti, single_voxel_lesion_nifti, method="max"
+            single_voxel_lesion_nifti, occupancy_nifti, method="max"
         )
         assert result.shape == (N_PARCELS,)
 
@@ -236,13 +236,24 @@ class TestInferDisruption:
 class TestDisruptionToVolume:
     """Tests for mapping disruption scores back to a spatial volume."""
 
-    def test_disruption_to_volume_shape(self, occupancy_nifti):
+    def test_disruption_to_volume_shape(self, tmp_path):
         """Output volume should have the correct 3D spatial shape."""
-        disruption_scores = np.array([0.8, 0.6, 0.4, 0.2, 0.0])
-        result = disruption_to_volume(disruption_scores, occupancy_nifti)
+        # Create a simple parcellation where each voxel has a label 1-5
+        parc_data = np.zeros(VOLUME_SHAPE, dtype=np.int32)
+        for i in range(N_PARCELS):
+            parc_data[i * 2 : (i + 1) * 2, :, :] = i + 1
 
-        # Result should be a 3D volume matching the spatial dimensions
-        assert result.shape == VOLUME_SHAPE
+        parc_path = tmp_path / "parcellation.nii.gz"
+        nib.save(nib.Nifti1Image(parc_data, AFFINE), str(parc_path))
+
+        ref_path = tmp_path / "reference.nii.gz"
+        nib.save(nib.Nifti1Image(np.zeros(VOLUME_SHAPE, dtype=np.float32), AFFINE), str(ref_path))
+
+        disruption_scores = np.array([0.8, 0.6, 0.4, 0.2, 0.0])
+        result_img = disruption_to_volume(disruption_scores, parc_path, ref_path)
+
+        # Result should be a NIfTI image with the correct 3D spatial shape
+        assert result_img.shape == VOLUME_SHAPE
 
 
 # ---------------------------------------------------------------------------
@@ -256,10 +267,10 @@ class TestAffineMismatch:
         self, occupancy_nifti, mismatched_affine_lesion_nifti
     ):
         """Mismatched affines between occupancy and lesion should raise."""
-        with pytest.raises(AssertionError):
+        with pytest.raises(ValueError):
             infer_disruption(
-                occupancy_nifti,
                 mismatched_affine_lesion_nifti,
+                occupancy_nifti,
                 method="max",
             )
 

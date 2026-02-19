@@ -95,15 +95,17 @@ would introduce artifactual discontinuities in the disruption predictions.
 
 ## A6: Inference Aggregation Method
 
-**Assumption:** The default inference method is `max` — for each cortical parcel,
-the disruption probability equals the maximum pathway occupancy value among all
+**Assumption:** The default inference method is `mean` — for each cortical parcel,
+the disruption probability equals the average pathway occupancy value across all
 lesion voxels.
 
-**Rationale:** A single voxel of complete fiber transection is sufficient to
-disconnect all streamlines passing through that point. The `max` method captures
-this "weakest link" principle.
+**Rationale:** The mean method provides a smoothed estimate of disconnection that
+accounts for the spatial extent of the lesion, weighting each voxel's contribution
+proportionally. This avoids the sensitivity to single extreme voxels that
+characterizes the `max` method.
 
 **Alternative methods** (implemented for comparison):
-- `mean`: average pathway occupancy across lesion voxels (underestimates focal lesions)
+- `max`: maximum pathway occupancy across lesion voxels ("weakest link" — a single
+  voxel of complete fiber transection suffices to disconnect)
 - `weighted_sum`: total pathway volume affected (correlates with lesion size)
 - `threshold_fraction`: fraction of pathway volume intersected (most interpretable)
