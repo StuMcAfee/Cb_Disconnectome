@@ -1,0 +1,19 @@
+# Data files (tracked by Git LFS or not committed)
+data/raw/hcp/
+*.nii
+*.nii.gz
+*.trk
+*.tck
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
