@@ -69,7 +69,7 @@ from src.flatmap import plot_disruption_flatmap
 disruption = infer_disruption(
     'my_lesion_SUIT.nii.gz',
     'data/final/pathway_occupancy_4d.nii.gz',
-    method='mean'
+    method='max'
 )
 
 # Render on SUIT flatmap
@@ -137,12 +137,12 @@ Four aggregation methods are available:
 
 | Method | Formula | Interpretation |
 |--------|---------|----------------|
-| `mean` (default) | average occupancy across lesion voxels | Smoothed estimate weighted by spatial extent |
-| `max` | max occupancy across lesion voxels | "Weakest link" — single-voxel transection suffices |
+| `max` (default) | max occupancy across lesion voxels | "Weakest link" — single-voxel transection suffices |
+| `mean` | average occupancy across lesion voxels | Smoothed estimate weighted by spatial extent |
 | `weighted_sum` | normalized sum of occupancy | Correlates with lesion size |
 | `threshold_fraction` | fraction of pathway volume intersected | Most biologically interpretable |
 
-The default is `mean`, which provides a smoothed estimate of disconnection that accounts for the spatial extent of the lesion.
+The default is `max`, following the principle that a single point of complete fiber transection is sufficient to disconnect all streamlines passing through it.
 
 ## Modeling Assumptions
 

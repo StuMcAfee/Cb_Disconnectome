@@ -8,8 +8,8 @@ Input:  Binary lesion mask in SUIT space (NIfTI, 3D)
 Output: 1D array of disruption probabilities, one per cortical parcel
 
 Aggregation methods:
-  - mean (default):    average pathway occupancy across lesion voxels
-  - max:               maximum pathway occupancy across lesion voxels
+  - max (default):     maximum pathway occupancy across lesion voxels
+  - mean:              average pathway occupancy across lesion voxels
   - weighted_sum:      sum of occupancy values, normalized to [0, 1]
   - threshold_fraction: fraction of pathway volume intersected (threshold > 0.1)
 
@@ -57,7 +57,7 @@ VALID_METHODS = ("max", "mean", "weighted_sum", "threshold_fraction")
 def infer_disruption(
     lesion_path: str | Path,
     occupancy_path: str | Path,
-    method: str = "mean",
+    method: str = "max",
 ) -> np.ndarray:
     """
     Compute parcel-wise cortical disruption from a cerebellar lesion mask.
