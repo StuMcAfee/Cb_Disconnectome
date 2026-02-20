@@ -10,18 +10,18 @@ Pipeline
 --------
 1. Load SUIT pial and white-matter surface GIfTI files (28,935 matched
    vertices).
-2. Load the cortico-nuclear probability map from Step 1 (X, Y, Z, 4).
+2. Load the cortico-nuclear probability map from Step 1 (X, Y, Z, 8).
 3. For each vertex, sample the cortico-nuclear map at 6 depths between the
-   pial and white surfaces, then average to produce a (4,) nuclear projection
-   probability vector.
+   pial and white surfaces, then average to produce an (8,) bilateral nuclear
+   projection probability vector.
 4. Determine each vertex's SUIT lobular label for summary/reporting.
-5. Load and combine the four per-nucleus efferent density maps (Step 2) into
+5. Load and combine the eight per-nucleus efferent density maps (Step 2) into
    a single 4D NIfTI in SUIT space for use at inference time.
 
 Outputs
 -------
 - data/final/vertex_projections.npz
-      projections  (28935, 4)   nuclear projection probabilities
+      projections  (28935, 8)   bilateral nuclear projection probabilities
       pial_coords  (28935, 3)   pial surface coordinates (SUIT mm)
       white_coords (28935, 3)   white surface coordinates (SUIT mm)
       parcel_labels (28935,)    SUIT lobular label per vertex (1-28; 0=outside)
@@ -54,8 +54,11 @@ from src.utils import (
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-# Nucleus indices — must match the ordering used by cortico_nuclear_map.py
-NUCLEUS_NAMES = ["fastigial", "emboliform", "globose", "dentate"]
+# Nucleus names — must match the ordering used by cortico_nuclear_map.py
+NUCLEUS_NAMES = [
+    "left_fastigial", "left_emboliform", "left_globose", "left_dentate",
+    "right_fastigial", "right_emboliform", "right_globose", "right_dentate",
+]
 N_NUCLEI = len(NUCLEUS_NAMES)
 
 # Default label-to-name mapping for the 28 cortical labels in the SUIT
@@ -284,7 +287,7 @@ def _load_cortico_nuclear_map() -> tuple[np.ndarray, np.ndarray]:
     """
     Load the cortico-nuclear probability map produced by Step 1.
 
-    Returns (data, affine) where data has shape (X, Y, Z, 4).
+    Returns (data, affine) where data has shape (X, Y, Z, 8).
     """
     cn_path = DATA_INTERIM / "cortico_nuclear_prob_map.nii.gz"
     if not cn_path.exists():
@@ -306,9 +309,9 @@ def _load_efferent_density_maps() -> tuple[np.ndarray, np.ndarray]:
     Load efferent density maps from Step 2.
 
     Looks first for a combined 4D NIfTI, then falls back to loading and
-    stacking 4 individual per-nucleus files.
+    stacking 8 individual per-nucleus files (bilateral).
 
-    Returns (data, affine) where data has shape (X, Y, Z, 4).
+    Returns (data, affine) where data has shape (X, Y, Z, 8).
     """
     # Strategy 1: combined 4D file
     for name in [
@@ -378,9 +381,9 @@ def save_vertex_metadata(
     metadata = {
         "description": (
             "Per-vertex nuclear projection data for the cerebellar "
-            "disconnectome model.  Each surface vertex has a 4-element "
-            "probability vector indicating its projection strength to "
-            "each deep cerebellar nucleus."
+            "disconnectome model.  Each surface vertex has an 8-element "
+            "bilateral probability vector indicating its projection "
+            "strength to each deep cerebellar nucleus (4 per hemisphere)."
         ),
         "space": "SUIT",
         "n_vertices": n_vertices,
@@ -462,7 +465,7 @@ def build_vertex_projections(
     projections = sample_volume_at_vertices(
         cn_map, cn_affine, pial_coords, white_coords, DEFAULT_DEPTHS,
     )
-    # projections shape: (n_vertices, 4)
+    # projections shape: (n_vertices, 8)
 
     # Normalise each vertex's projection vector to sum to 1
     row_sums = projections.sum(axis=1, keepdims=True)

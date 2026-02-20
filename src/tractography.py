@@ -5,23 +5,28 @@ Traces and filters streamlines from each deep cerebellar nucleus through the
 superior cerebellar peduncle (SCP) and downstream, using the Elias et al.
 (2024) normative structural connectome (HCP-derived).
 
-For each nuclear subregion (fastigial, emboliform, globose, dentate), this
-module produces a 3D probability map showing where its efferent fibers travel.
+For each nuclear subregion (8 bilateral: left/right × fastigial, emboliform,
+globose, dentate), this module produces a 3D probability map showing where
+its efferent fibers travel.
 
 Pipeline:
     1. Load whole-brain streamlines (.trk / .tck) from the normative connectome
-    2. Load or create nuclear seed masks in MNI space
+    2. Load or create bilateral nuclear seed masks in MNI space
     3. Filter streamlines that pass through each nuclear ROI
     4. Further filter to keep only efferent streamlines passing through SCP
     5. Convert surviving streamlines to voxel-wise density maps
     6. Normalize each density map to probability (0-1)
     7. Save one density map per nucleus to data/interim/
 
-Output files:
-    data/interim/efferent_density_fastigial.nii.gz
-    data/interim/efferent_density_emboliform.nii.gz
-    data/interim/efferent_density_globose.nii.gz
-    data/interim/efferent_density_dentate.nii.gz
+Output files (8 bilateral maps):
+    data/interim/efferent_density_left_fastigial.nii.gz
+    data/interim/efferent_density_right_fastigial.nii.gz
+    data/interim/efferent_density_left_emboliform.nii.gz
+    data/interim/efferent_density_right_emboliform.nii.gz
+    data/interim/efferent_density_left_globose.nii.gz
+    data/interim/efferent_density_right_globose.nii.gz
+    data/interim/efferent_density_left_dentate.nii.gz
+    data/interim/efferent_density_right_dentate.nii.gz
 
 Usage:
     python -m src.tractography [--config config.json] [--connectome-dir PATH]
@@ -50,8 +55,11 @@ from src.utils import (
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-# Deep cerebellar nuclei in processing order
-NUCLEUS_NAMES = ["fastigial", "emboliform", "globose", "dentate"]
+# Deep cerebellar nuclei: 4 per hemisphere, 8 total (bilateral)
+NUCLEUS_NAMES = [
+    "left_fastigial", "left_emboliform", "left_globose", "left_dentate",
+    "right_fastigial", "right_emboliform", "right_globose", "right_dentate",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -231,14 +239,18 @@ def create_nuclear_masks_mni(
 
     nuclei_dir = Path(nuclei_dir) if nuclei_dir else ATLAS_DIR
 
-    # Search patterns for each nucleus.
+    # Search patterns for each bilateral nucleus.
     # "emboliform" and "globose" are the anterior/posterior interposed nuclei;
     # some atlases label them collectively as "interposed".
     search_aliases = {
-        "fastigial": ["fastigial", "Fastigial"],
-        "emboliform": ["emboliform", "Emboliform", "interposed", "Interposed"],
-        "globose": ["globose", "Globose", "interposed", "Interposed"],
-        "dentate": ["dentate", "Dentate"],
+        "left_fastigial": ["left_fastigial", "Left_Fastigial", "fastigial", "Fastigial"],
+        "right_fastigial": ["right_fastigial", "Right_Fastigial", "fastigial", "Fastigial"],
+        "left_emboliform": ["left_emboliform", "Left_Emboliform", "interposed", "Interposed"],
+        "right_emboliform": ["right_emboliform", "Right_Emboliform", "interposed", "Interposed"],
+        "left_globose": ["left_globose", "Left_Globose", "interposed", "Interposed"],
+        "right_globose": ["right_globose", "Right_Globose", "interposed", "Interposed"],
+        "left_dentate": ["left_dentate", "Left_Dentate", "dentate", "Dentate"],
+        "right_dentate": ["right_dentate", "Right_Dentate", "dentate", "Dentate"],
     }
 
     masks = {}
@@ -361,16 +373,18 @@ def _extract_nucleus_from_parcellation(
     mni_reference: nib.Nifti1Image | None,
 ) -> nib.Nifti1Image:
     """
-    Extract a nuclear mask from the SUIT anatomical parcellation.
+    Extract a bilateral nuclear mask from the SUIT anatomical parcellation.
 
     The SUIT parcellation labels include entries for Dentate, Interposed,
-    and Fastigial nuclei. This function extracts the relevant labels and
-    creates a binary mask, resampling to MNI space if needed.
+    and Fastigial nuclei (left and right). This function extracts the
+    relevant single-hemisphere label and creates a binary mask, resampling
+    to MNI space if needed.
 
     Parameters
     ----------
     nucleus : str
-        One of 'fastigial', 'emboliform', 'globose', 'dentate'.
+        One of the bilateral nucleus names (e.g. 'left_fastigial',
+        'right_dentate').
     atlas_dir : Path
         Directory containing the SUIT parcellation.
     mni_reference : nibabel.Nifti1Image or None
@@ -383,14 +397,24 @@ def _extract_nucleus_from_parcellation(
     """
     from nilearn.image import resample_to_img
 
-    # Label indices from the standard SUIT anatomical parcellation.
-    # Left and Right labels for each nucleus.
+    # Single-hemisphere label indices from SUIT anatomical parcellation.
+    # Each bilateral nucleus maps to exactly one SUIT label.
     nucleus_labels = {
-        "fastigial": [33, 34],       # Left/Right Fastigial
-        "dentate": [29, 30],          # Left/Right Dentate
-        "emboliform": [31, 32],       # Left/Right Interposed (anterior part)
-        "globose": [31, 32],          # Left/Right Interposed (posterior part)
+        "left_fastigial": [33],
+        "right_fastigial": [34],
+        "left_dentate": [29],
+        "right_dentate": [30],
+        "left_emboliform": [31],      # Left Interposed (anterior part)
+        "right_emboliform": [32],     # Right Interposed (anterior part)
+        "left_globose": [31],         # Left Interposed (posterior part)
+        "right_globose": [32],        # Right Interposed (posterior part)
     }
+
+    if nucleus not in nucleus_labels:
+        raise ValueError(
+            f"Unknown nucleus '{nucleus}'. "
+            f"Expected one of: {list(nucleus_labels.keys())}"
+        )
 
     # Find the parcellation file (prefer MNI, then SUIT)
     parc_path = None
@@ -413,10 +437,11 @@ def _extract_nucleus_from_parcellation(
     labels = nucleus_labels[nucleus]
     mask_data = np.isin(parc_data, labels).astype(np.float32)
 
-    # For emboliform/globose (both map to "interposed"), split the mask
-    # along the anterior-posterior axis. Emboliform is anterior, globose
-    # is posterior within the interposed nucleus.
-    if nucleus in ("emboliform", "globose"):
+    # For emboliform/globose (both derive from "interposed" label on the
+    # same side), split the single-hemisphere interposed mask along the
+    # anterior-posterior axis. Emboliform is anterior, globose is posterior.
+    base_type = nucleus.split("_", 1)[1]  # e.g. "emboliform" from "left_emboliform"
+    if base_type in ("emboliform", "globose"):
         mask_voxels = np.argwhere(mask_data > 0)
         if mask_voxels.size > 0:
             # Determine anterior-posterior axis (typically the y-axis
@@ -424,9 +449,8 @@ def _extract_nucleus_from_parcellation(
             y_coords = mask_voxels[:, 1]
             y_median = np.median(y_coords)
 
-            if nucleus == "emboliform":
+            if base_type == "emboliform":
                 # Anterior interposed: voxels with y >= median
-                # (more anterior in standard orientation)
                 ap_mask = np.zeros_like(mask_data)
                 ap_mask[mask_voxels[y_coords >= y_median, 0],
                         mask_voxels[y_coords >= y_median, 1],

@@ -18,7 +18,7 @@ from src.utils import make_sphere_lesion
 # ---------------------------------------------------------------------------
 
 VOLUME_SHAPE = (10, 10, 10)
-N_NUCLEI = 4
+N_NUCLEI = 8  # Bilateral: 4 per hemisphere
 N_VERTICES = 10
 AFFINE = np.eye(4)  # 1mm isotropic, origin at (0, 0, 0)
 
@@ -30,13 +30,17 @@ AFFINE = np.eye(4)  # 1mm isotropic, origin at (0, 0, 0)
 @pytest.fixture
 def efferent_nifti(tmp_path):
     """
-    Create a synthetic 4D efferent density volume (10x10x10x4).
+    Create a synthetic 4D efferent density volume (10x10x10x8).
 
-    Each nucleus has a distinct spatial profile:
-      - nucleus 0: gradient along x  (0 at x=0, 1 at x=9)
-      - nucleus 1: gradient along y
-      - nucleus 2: gradient along z
-      - nucleus 3: uniform 0.5
+    8 bilateral nuclei. Each has a distinct spatial profile:
+      - nucleus 0 (left_fastigial):  gradient along x
+      - nucleus 1 (left_emboliform): gradient along y
+      - nucleus 2 (left_globose):    gradient along z
+      - nucleus 3 (left_dentate):    uniform 0.5
+      - nucleus 4 (right_fastigial): reverse gradient along x
+      - nucleus 5 (right_emboliform): reverse gradient along y
+      - nucleus 6 (right_globose):   reverse gradient along z
+      - nucleus 7 (right_dentate):   uniform 0.3
     """
     data = np.zeros((*VOLUME_SHAPE, N_NUCLEI), dtype=np.float32)
 
@@ -47,6 +51,13 @@ def efferent_nifti(tmp_path):
     for k in range(VOLUME_SHAPE[2]):
         data[:, :, k, 2] = k / (VOLUME_SHAPE[2] - 1)
     data[:, :, :, 3] = 0.5
+    for i in range(VOLUME_SHAPE[0]):
+        data[i, :, :, 4] = 1.0 - i / (VOLUME_SHAPE[0] - 1)
+    for j in range(VOLUME_SHAPE[1]):
+        data[:, j, :, 5] = 1.0 - j / (VOLUME_SHAPE[1] - 1)
+    for k in range(VOLUME_SHAPE[2]):
+        data[:, :, k, 6] = 1.0 - k / (VOLUME_SHAPE[2] - 1)
+    data[:, :, :, 7] = 0.3
 
     path = tmp_path / "efferent_4d.nii.gz"
     nib.save(nib.Nifti1Image(data, AFFINE), str(path))
@@ -56,34 +67,34 @@ def efferent_nifti(tmp_path):
 @pytest.fixture
 def vertex_projections(tmp_path):
     """
-    Create synthetic vertex projections for 10 vertices.
+    Create synthetic vertex projections for 10 vertices (8 bilateral nuclei).
 
-    Vertex projection profiles:
-      0: [1, 0, 0, 0]  (projects to nucleus 0 only)
-      1: [0, 1, 0, 0]  (projects to nucleus 1 only)
-      2: [0, 0, 1, 0]  (projects to nucleus 2 only)
-      3: [0, 0, 0, 1]  (projects to nucleus 3 only)
-      4: [0.25, 0.25, 0.25, 0.25]  (uniform)
-      5: [0.5, 0.5, 0, 0]
-      6: [0, 0, 0.5, 0.5]
-      7: [0.8, 0.1, 0.05, 0.05]
-      8: [0, 0, 0, 0]  (zero projection edge case)
-      9: [0.25, 0.25, 0.25, 0.25]
+    Vertex projection profiles (8 elements: L_F, L_E, L_G, L_D, R_F, R_E, R_G, R_D):
+      0: [1, 0, 0, 0, 0, 0, 0, 0]    (projects to left fastigial only)
+      1: [0, 1, 0, 0, 0, 0, 0, 0]    (projects to left emboliform only)
+      2: [0, 0, 1, 0, 0, 0, 0, 0]    (projects to left globose only)
+      3: [0, 0, 0, 1, 0, 0, 0, 0]    (projects to left dentate only)
+      4: [0.125]*8                     (uniform across all 8)
+      5: [0.25, 0.25, 0, 0, 0.25, 0.25, 0, 0]  (fastigial+emboliform bilateral)
+      6: [0, 0, 0.25, 0.25, 0, 0, 0.25, 0.25]  (globose+dentate bilateral)
+      7: [0.4, 0.05, 0.025, 0.025, 0.4, 0.05, 0.025, 0.025]  (mainly fastigial)
+      8: [0, 0, 0, 0, 0, 0, 0, 0]    (zero projection edge case)
+      9: [0, 0, 0, 0, 0.25, 0.25, 0.25, 0.25]  (right side only)
 
     Vertex coordinates placed at known volume locations for direct
     injury testing.  Pial and white coords are offset slightly.
     """
     proj = np.array([
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-        [0.25, 0.25, 0.25, 0.25],
-        [0.5, 0.5, 0.0, 0.0],
-        [0.0, 0.0, 0.5, 0.5],
-        [0.8, 0.1, 0.05, 0.05],
-        [0.0, 0.0, 0.0, 0.0],
-        [0.25, 0.25, 0.25, 0.25],
+        [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+        [0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125],
+        [0.25, 0.25, 0.0, 0.0, 0.25, 0.25, 0.0, 0.0],
+        [0.0, 0.0, 0.25, 0.25, 0.0, 0.0, 0.25, 0.25],
+        [0.4, 0.05, 0.025, 0.025, 0.4, 0.05, 0.025, 0.025],
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 0.25, 0.25, 0.25, 0.25],
     ], dtype=np.float32)
 
     # Place vertices at specific locations inside the 10x10x10 volume.
@@ -190,19 +201,19 @@ class TestInferDisruption:
         """
         Max method with a single voxel at (9,9,9).
 
-        Efferent density at (9,9,9):
-          nucleus 0: 9/9 = 1.0  (x-gradient)
-          nucleus 1: 9/9 = 1.0  (y-gradient)
-          nucleus 2: 9/9 = 1.0  (z-gradient)
-          nucleus 3: 0.5         (uniform)
+        Efferent density at (9,9,9) for 8 bilateral nuclei:
+          nucleus 0 (L_F): 9/9 = 1.0    nucleus 4 (R_F): 0.0
+          nucleus 1 (L_E): 9/9 = 1.0    nucleus 5 (R_E): 0.0
+          nucleus 2 (L_G): 9/9 = 1.0    nucleus 6 (R_G): 0.0
+          nucleus 3 (L_D): 0.5           nucleus 7 (R_D): 0.3
 
-        With only 1 lesion voxel, scores = E @ P.T where E = [1, 1, 1, 0.5]:
-          vertex 0 (proj [1,0,0,0]): 1*1 + 0*1 + 0*1 + 0*0.5 = 1.0
-          vertex 1 (proj [0,1,0,0]): 1.0
-          vertex 2 (proj [0,0,1,0]): 1.0
-          vertex 3 (proj [0,0,0,1]): 0.5
-          vertex 4 (proj [.25,.25,.25,.25]): 0.25+0.25+0.25+0.125 = 0.875
-          vertex 8 (proj [0,0,0,0]): 0.0
+        With only 1 lesion voxel, scores = E @ P.T where
+        E = [1, 1, 1, 0.5, 0, 0, 0, 0.3]:
+          vertex 0 (proj [1,0,0,0, 0,0,0,0]): 1.0
+          vertex 3 (proj [0,0,0,1, 0,0,0,0]): 0.5
+          vertex 8 (proj all zeros): 0.0
+          vertex 9 (proj [0,0,0,0, .25,.25,.25,.25]):
+              0*0.25 + 0*0.25 + 0*0.25 + 0.3*0.25 = 0.075
         """
         result = infer_disruption(
             single_voxel_lesion_nifti, efferent_nifti, vertex_projections,
@@ -213,12 +224,14 @@ class TestInferDisruption:
         # Vertex 4 is at (9,9,9) so direct injury sets it to 1.0
         assert result[4] == pytest.approx(1.0)
 
-        # Vertex 0: projects only to nucleus 0
+        # Vertex 0: projects only to left fastigial (density=1.0)
         assert result[0] == pytest.approx(1.0, abs=1e-5)
-        # Vertex 3: projects only to nucleus 3 (uniform 0.5)
+        # Vertex 3: projects only to left dentate (density=0.5)
         assert result[3] == pytest.approx(0.5, abs=1e-5)
         # Vertex 8: zero projection -> 0.0
         assert result[8] == pytest.approx(0.0, abs=1e-5)
+        # Vertex 9: projects only to right-side nuclei
+        assert result[9] == pytest.approx(0.075, abs=1e-5)
 
     def test_infer_disruption_mean_method(
         self, efferent_nifti, vertex_projections, block_lesion_nifti
@@ -229,8 +242,8 @@ class TestInferDisruption:
         )
         assert result.shape == (N_VERTICES,)
 
-        # Vertex 3 projects only to nucleus 3 (uniform 0.5).
-        # All lesion voxels have nucleus 3 density = 0.5.
+        # Vertex 3 projects only to left dentate (index 3, uniform 0.5).
+        # All lesion voxels have left dentate density = 0.5.
         # score for each voxel: 1 * 0.5 = 0.5, mean = 0.5
         assert result[3] == pytest.approx(0.5, abs=1e-5)
 

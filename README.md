@@ -62,11 +62,17 @@ python -m src.inference path/to/lesion_SUIT.nii.gz [output_directory]
 ### Python API
 
 ```python
-from src.inference import infer_disruption
+from src.inference import infer_disruption, infer_disruption_sparse
 from src.flatmap import plot_disruption_flatmap
 
 # Compute vertex-level disruption probabilities (28,935 values)
 disruption = infer_disruption(
+    'my_lesion_SUIT.nii.gz',
+    method='max'
+)
+
+# Or use the sparse matrix backend (captures all disconnection layers)
+disruption = infer_disruption_sparse(
     'my_lesion_SUIT.nii.gz',
     method='max'
 )
@@ -81,7 +87,7 @@ plot_disruption_flatmap(
 
 ## Pipeline Overview
 
-The model is built in 5 steps:
+The model is built in 6 steps:
 
 | Step | Module | Description |
 |------|--------|-------------|
@@ -89,6 +95,7 @@ The model is built in 5 steps:
 | 1 | `src/cortico_nuclear_map.py` | Map cerebellar cortex voxels to deep nuclei targets |
 | 2 | `src/tractography.py` | Build efferent pathway density maps from normative tractography |
 | 3 | `src/build_4d_nifti.py` | Compute per-vertex nuclear projections using SUIT surfaces |
+| 3b | `src/disconnection_matrix.py` | Build sparse voxel-to-vertex disconnection matrix |
 | 4 | `src/inference.py` | Lesion mask → vertex-wise cortical disruption probabilities |
 | 5 | `src/flatmap.py` | Render results on SUIT cerebellar flatmap |
 
@@ -106,6 +113,9 @@ python -m src.tractography
 
 # Step 3: Compute per-vertex nuclear projections
 python -m src.build_4d_nifti
+
+# Step 3b: Build sparse disconnection matrix (optional, enables sparse inference)
+python -m src.disconnection_matrix
 ```
 
 ## Vertex-Level Architecture
@@ -114,24 +124,48 @@ The core data products are:
 
 ### Step 3 outputs (in `data/final/`)
 
-- **`vertex_projections.npz`** — per-vertex nuclear projection data:
-  - `projections` (28935, 4): probability that each vertex projects to each nucleus
+- **`vertex_projections.npz`** — per-vertex bilateral nuclear projection data:
+  - `projections` (28935, 8): probability that each vertex projects to each bilateral nucleus
   - `pial_coords` (28935, 3): pial surface coordinates in SUIT mm
   - `white_coords` (28935, 3): white-matter surface coordinates in SUIT mm
   - `parcel_labels` (28935,): SUIT lobular label per vertex (1-28)
-- **`efferent_density_suit_4d.nii.gz`** — combined efferent density maps (X, Y, Z, 4)
+- **`efferent_density_suit_4d.nii.gz`** — combined efferent density maps (X, Y, Z, 8)
 - **`vertex_metadata.json`** — JSON metadata sidecar
 
-### Inference (on-the-fly)
+Bilateral nuclei (8 total, 4 per hemisphere):
+- Indices 0-3: left fastigial, left emboliform, left globose, left dentate
+- Indices 4-7: right fastigial, right emboliform, right globose, right dentate
 
-For a lesion mask with N voxels:
+### Step 3b outputs (in `data/final/`)
 
-1. Extract efferent density at lesion voxels → `E` of shape `(N_lesion, 4)`
+- **`disconnection_matrix.npz`** — sparse CSR matrix (n_suit_voxels, 28935):
+  `D[v, p]` = probability that lesioning voxel `v` disconnects vertex `p`.
+  Captures four disconnection mechanisms:
+  - **Layer 1:** Direct cortical injury (cortical voxels overlapping vertex locations)
+  - **Layers 2+3:** Nuclear relay + efferent pathway (via `e @ P.T` for each voxel)
+  - **Layer 4:** Internal WM disconnection (placeholder for future implementation)
+- **`disconnection_matrix_metadata.json`** — JSON metadata sidecar
+
+### Inference
+
+Two inference backends are available:
+
+**On-the-fly matmul** (default): For a lesion mask with N voxels:
+
+1. Extract efferent density at lesion voxels → `E` of shape `(N_lesion, 8)`
 2. Matrix multiply: `E @ P.T` → `(N_lesion, 28935)` per-voxel per-vertex scores
 3. Aggregate across lesion voxels (max/mean/etc.) → `(28935,)` disruption scores
 4. Direct injury: vertices whose cortical locations overlap the lesion → set to 1.0
 
-The output maps directly onto the SUIT flatmap by vertex index — no volume-to-surface projection is needed.
+**Sparse matrix** (captures all disconnection layers): For a lesion mask:
+
+1. Select lesion rows from the precomputed sparse matrix → `D_lesion` (N_lesion, 28935)
+2. Aggregate across lesion voxels (max/mean/weighted_sum) → `(28935,)` disruption scores
+
+The sparse backend is recommended when the disconnection matrix has been built
+(Step 3b) because it captures all disconnection mechanisms in a single lookup.
+
+Both backends output vertex-indexed arrays that map directly onto the SUIT flatmap — no volume-to-surface projection is needed.
 
 ## Inference Methods
 
@@ -165,6 +199,7 @@ These assumptions and their limitations are discussed in detail in the assumptio
 │   ├── cortico_nuclear_map.py  # Cortex-to-nuclei mapping
 │   ├── tractography.py     # Efferent pathway modeling
 │   ├── build_4d_nifti.py   # Vertex projection assembly
+│   ├── disconnection_matrix.py  # Sparse voxel-to-vertex disconnection matrix
 │   ├── inference.py        # Lesion inference engine
 │   ├── flatmap.py          # SUIT flatmap visualization
 │   └── utils.py            # Shared utilities

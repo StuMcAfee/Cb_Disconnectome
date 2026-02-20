@@ -55,8 +55,19 @@ DISRUPTION_CMAP = LinearSegmentedColormap.from_list(
     "disruption", _DISRUPTION_COLORS, N=256
 )
 
-# Nuclear target colormap: background, fastigial, interposed, dentate
-_NUCLEAR_COLORS = ["#333333", "#E31A1C", "#33A02C", "#1F78B4"]
+# Nuclear target colormap: background + 8 bilateral nuclei
+# Left nuclei use saturated colors, right nuclei use lighter variants
+_NUCLEAR_COLORS = [
+    "#333333",  # 0: background
+    "#E31A1C",  # 1: left fastigial (red)
+    "#33A02C",  # 2: left emboliform (green)
+    "#33A02C",  # 3: left globose (green — same as emboliform)
+    "#1F78B4",  # 4: left dentate (blue)
+    "#FB9A99",  # 5: right fastigial (light red)
+    "#B2DF8A",  # 6: right emboliform (light green)
+    "#B2DF8A",  # 7: right globose (light green — same as emboliform)
+    "#A6CEE3",  # 8: right dentate (light blue)
+]
 NUCLEAR_CMAP = ListedColormap(_NUCLEAR_COLORS, name="nuclear_targets")
 
 # Inference method display names (order matters for the 2x2 grid)
@@ -239,11 +250,12 @@ def plot_nuclear_targets_flatmap(
     """
     Plot a winner-take-all nuclear target assignment on the cerebellar flatmap.
 
-    Color coding:
-      - 0 (background/non-cortical): dark grey
-      - 1 (fastigial): red
-      - 2 (interposed): green
-      - 3 (dentate): blue
+    Color coding (bilateral nuclei 0-7):
+      - background/non-cortical: dark grey
+      - left fastigial/right fastigial: red/light red
+      - left emboliform/right emboliform: green/light green
+      - left globose/right globose: green/light green
+      - left dentate/right dentate: blue/light blue
 
     Parameters
     ----------
@@ -261,24 +273,15 @@ def plot_nuclear_targets_flatmap(
     surf_data = project_to_flatmap(winner_volume_path)
 
     surf_labels = np.round(surf_data).astype(int)
-    surf_labels_shifted = surf_labels + 1
-
-    nuclear_colors = [
-        "#333333",  # 0: non-cortical / background
-        "#E31A1C",  # 1: fastigial (red)
-        "#33A02C",  # 2: interposed - emboliform (green)
-        "#33A02C",  # 3: interposed - globose (green)
-        "#1F78B4",  # 4: dentate (blue)
-    ]
-    cmap = ListedColormap(nuclear_colors, name="nuclear_targets_5")
+    surf_labels_shifted = surf_labels + 1  # shift so -1 -> 0 (background)
 
     fig = plt.figure(figsize=(10, 8))
 
     suit.flatmap.plot(
         surf_labels_shifted.astype(float),
         render="matplotlib",
-        cmap=cmap,
-        cscale=[0, 4],
+        cmap=NUCLEAR_CMAP,
+        cscale=[0, len(_NUCLEAR_COLORS) - 1],
         new_figure=False,
     )
 
@@ -286,9 +289,12 @@ def plot_nuclear_targets_flatmap(
 
     from matplotlib.patches import Patch
     legend_elements = [
-        Patch(facecolor="#E31A1C", edgecolor="black", label="Fastigial"),
-        Patch(facecolor="#33A02C", edgecolor="black", label="Interposed"),
-        Patch(facecolor="#1F78B4", edgecolor="black", label="Dentate"),
+        Patch(facecolor="#E31A1C", edgecolor="black", label="L Fastigial"),
+        Patch(facecolor="#FB9A99", edgecolor="black", label="R Fastigial"),
+        Patch(facecolor="#33A02C", edgecolor="black", label="L Interposed"),
+        Patch(facecolor="#B2DF8A", edgecolor="black", label="R Interposed"),
+        Patch(facecolor="#1F78B4", edgecolor="black", label="L Dentate"),
+        Patch(facecolor="#A6CEE3", edgecolor="black", label="R Dentate"),
     ]
     plt.legend(
         handles=legend_elements,
