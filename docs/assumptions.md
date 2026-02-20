@@ -95,15 +95,36 @@ would introduce artifactual discontinuities in the disruption predictions.
 
 ## A6: Inference Aggregation Method
 
-**Assumption:** The default inference method is `max` — for each cortical parcel,
-the disruption probability equals the maximum pathway occupancy value among all
-lesion voxels.
+**Assumption:** The default inference method is `max` — for each cortical surface
+vertex, the disruption probability equals the maximum weighted efferent density
+across all lesion voxels.
 
 **Rationale:** A single voxel of complete fiber transection is sufficient to
 disconnect all streamlines passing through that point. The `max` method captures
 this "weakest link" principle.
 
 **Alternative methods** (implemented for comparison):
-- `mean`: average pathway occupancy across lesion voxels (smoothed estimate)
-- `weighted_sum`: total pathway volume affected (correlates with lesion size)
-- `threshold_fraction`: fraction of pathway volume intersected (most interpretable)
+- `mean`: average weighted density across lesion voxels (smoothed estimate)
+- `weighted_sum`: total weighted density affected (correlates with lesion size)
+- `threshold_fraction`: per-nucleus pathway fraction, combined by vertex projection weights
+
+## A7: Vertex-Level Resolution via SUIT Surfaces
+
+**Assumption:** Cortical disruption is resolved at the level of individual SUIT
+surface vertices (28,935 vertices) rather than at the level of whole lobular
+parcels (28 parcels).
+
+**Rationale:** The SUIT toolbox provides matched grey-matter (pial) and
+white-matter surface meshes in 3D space, plus a flat surface for 2D visualization.
+All three surfaces share identical vertex indexing, so a value computed at vertex N
+on the 3D surface can be directly plotted at vertex N on the flatmap.
+
+The cortico-nuclear probability map from Step 1 is sampled at each vertex's
+cortical location (6 depths between pial and white surfaces), preserving the
+smooth medial-lateral gradients rather than collapsing them into parcel averages.
+
+**Implementation:** At inference time, disruption is computed via matrix
+multiplication: `E_lesion @ P.T` where `E_lesion` is the (N_lesion, 4) efferent
+density at lesion voxels and `P` is the (28935, 4) per-vertex nuclear projection
+matrix.  This avoids precomputing the full (X, Y, Z, 28935) occupancy volume
+while delivering vertex-level resolution.
