@@ -133,7 +133,25 @@ def load_streamlines(connectome_path: str | Path) -> tuple:
 
     if suffix == ".trk":
         logger.info("Loading .trk streamlines: %s", connectome_path)
-        trk_file = load_trk(str(connectome_path), reference="same")
+        trk_file = load_trk(
+            str(connectome_path),
+            reference="same",
+            bbox_valid_check=False,
+        )
+
+        # Discard streamlines with coordinates outside the valid bounding box
+        # (some normative connectomes have a few streamlines that extend
+        # slightly past the volume boundary).
+        from dipy.io.streamline import StatefulTractogram
+        n_before = len(trk_file.streamlines)
+        trk_file.remove_invalid_streamlines()
+        n_after = len(trk_file.streamlines)
+        if n_before != n_after:
+            logger.warning(
+                "Removed %d invalid streamlines (out-of-bounds); "
+                "%d remaining.", n_before - n_after, n_after,
+            )
+
         streamlines = trk_file.streamlines
         header = dict(trk_file.header)
 
