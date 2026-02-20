@@ -12,12 +12,16 @@ Output: 1D array of disruption probabilities, one per surface vertex (28,935)
 Architecture
 ------------
 Precomputed data (from build_4d_nifti / Step 3):
-  - vertex_projections.npz: per-vertex nuclear projection probabilities
-    (N_vertices, 4) plus pial/white surface coordinates
-  - efferent_density_suit_4d.nii.gz: combined efferent density maps (X,Y,Z,4)
+  - vertex_projections.npz: per-vertex bilateral nuclear projection
+    probabilities (N_vertices, 8) plus pial/white surface coordinates
+  - efferent_density_suit_4d.nii.gz: combined efferent density maps (X,Y,Z,8)
+
+Bilateral nuclei (8 total, 4 per hemisphere):
+  [0-3] left:  fastigial, emboliform, globose, dentate
+  [4-7] right: fastigial, emboliform, globose, dentate
 
 At inference time, for a lesion with N voxels:
-  1. Extract efferent density at lesion voxels -> E (N_lesion, 4)
+  1. Extract efferent density at lesion voxels -> E (N_lesion, 8)
   2. Compute per-voxel per-vertex scores -> E @ P.T (N_lesion, N_vertices)
   3. Aggregate across lesion voxels (max/mean/etc.) -> (N_vertices,)
   4. Direct injury: if lesion overlaps a vertex's cortical location, set to 1.0
@@ -66,7 +70,7 @@ VALID_METHODS = ("max", "mean", "weighted_sum", "threshold_fraction")
 # Depth fractions for direct injury checking (pial=0 to white=1)
 _DIRECT_INJURY_DEPTHS = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
 
-N_NUCLEI = 4
+N_NUCLEI = 8
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +288,113 @@ def infer_disruption(
 
 
 # ---------------------------------------------------------------------------
+# Sparse matrix inference
+# ---------------------------------------------------------------------------
+
+DEFAULT_MATRIX_PATH = DATA_FINAL / "disconnection_matrix.npz"
+
+
+def infer_disruption_sparse(
+    lesion_path: str | Path,
+    matrix_path: str | Path = DEFAULT_MATRIX_PATH,
+    efferent_path: str | Path = DEFAULT_EFFERENT_PATH,
+    projections_path: str | Path = DEFAULT_PROJECTIONS_PATH,
+    method: str = "max",
+) -> np.ndarray:
+    """
+    Compute vertex-wise cortical disruption using the sparse disconnection
+    matrix.  This method captures ALL disconnection mechanisms including
+    cortical injury, nuclear relay, efferent pathway, and (when available)
+    internal cerebellar white matter disconnection.
+
+    Parameters
+    ----------
+    lesion_path : str or Path
+        Path to a binary lesion mask NIfTI in SUIT space (3D).
+    matrix_path : str or Path
+        Path to the sparse disconnection matrix (.npz).
+    efferent_path : str or Path
+        Path to the 4D efferent density maps (for shape/affine reference).
+    projections_path : str or Path
+        Path to vertex_projections.npz (for n_vertices reference).
+    method : str
+        Aggregation method: 'max', 'mean', or 'weighted_sum'.
+        'threshold_fraction' is not supported with sparse matrix inference.
+
+    Returns
+    -------
+    disruption : np.ndarray of shape (N_vertices,)
+        Disruption probability for each surface vertex.
+    """
+    import scipy.sparse as sp
+
+    valid_sparse_methods = ("max", "mean", "weighted_sum")
+    if method not in valid_sparse_methods:
+        raise ValueError(
+            f"Sparse matrix inference does not support method '{method}'. "
+            f"Choose from: {valid_sparse_methods}"
+        )
+
+    # --- Load inputs ---
+    logger.info("Loading lesion mask: %s", lesion_path)
+    lesion_data, lesion_affine, _ = load_nifti(lesion_path, dtype=np.float32)
+
+    logger.info("Loading disconnection matrix: %s", matrix_path)
+    D = sp.load_npz(str(matrix_path))
+    n_total_voxels, n_vertices = D.shape
+
+    # Verify the lesion grid matches the matrix
+    lesion_n_voxels = int(np.prod(lesion_data.shape[:3]))
+    if lesion_n_voxels != n_total_voxels:
+        raise ValueError(
+            f"Lesion voxel count ({lesion_n_voxels}) does not match "
+            f"disconnection matrix rows ({n_total_voxels}). "
+            "Both must be in the same SUIT space grid."
+        )
+
+    # --- Identify lesion voxels ---
+    lesion_flat = lesion_data.ravel() > 0
+    lesion_indices = np.where(lesion_flat)[0]
+    n_lesion = len(lesion_indices)
+    logger.info("Lesion voxels: %d", n_lesion)
+
+    if n_lesion == 0:
+        logger.warning("Lesion mask is empty; returning zero disruption.")
+        return np.zeros(n_vertices, dtype=np.float32)
+
+    # --- Extract lesion rows from the sparse matrix ---
+    D_lesion = D[lesion_indices, :]  # (n_lesion, n_vertices) sparse
+
+    # --- Aggregate ---
+    if method == "max":
+        # Element-wise max across lesion voxels
+        # .max(axis=0) on sparse returns a dense matrix; convert to array
+        disruption = np.asarray(D_lesion.max(axis=0).todense()).ravel()
+    elif method == "mean":
+        disruption = np.asarray(D_lesion.mean(axis=0)).ravel()
+    elif method == "weighted_sum":
+        raw_sum = np.asarray(D_lesion.sum(axis=0)).ravel()
+        max_val = float(raw_sum.max())
+        if max_val > 0:
+            disruption = raw_sum / max_val
+        else:
+            disruption = raw_sum
+
+    # Ensure dense float array before clipping
+    disruption = np.asarray(disruption, dtype=np.float64).ravel()
+    disruption = np.clip(disruption, 0.0, 1.0).astype(np.float32)
+
+    logger.info(
+        "Disruption (sparse, %s): min=%.4f, max=%.4f, mean=%.4f, "
+        "nonzero=%d / %d vertices",
+        method, disruption.min(), disruption.max(), disruption.mean(),
+        int((disruption > 0).sum()), n_vertices,
+    )
+
+    return disruption
+
+
+# ---------------------------------------------------------------------------
 # Summary table (aggregated by lobule)
 # ---------------------------------------------------------------------------
 
@@ -358,6 +469,7 @@ def run_inference(
     lesion_path: str | Path,
     output_dir: str | Path | None = None,
     methods: list[str] | None = None,
+    use_sparse: bool = False,
 ) -> dict[str, np.ndarray]:
     """
     Run lesion inference with one or more aggregation methods.
@@ -370,6 +482,10 @@ def run_inference(
         Directory for saving outputs.
     methods : list of str, optional
         Aggregation methods to run. Defaults to all available methods.
+    use_sparse : bool
+        If True, use the sparse disconnection matrix for inference
+        (captures all disconnection mechanisms including internal WM).
+        If False (default), use the legacy matmul approach.
 
     Returns
     -------
@@ -388,13 +504,18 @@ def run_inference(
     logger.info("=" * 60)
     logger.info("Lesion mask:   %s", lesion_path)
     logger.info("Methods:       %s", methods)
+    logger.info("Backend:       %s", "sparse matrix" if use_sparse else "matmul")
 
     results = {}
 
     for method in methods:
         logger.info("-" * 40)
         logger.info("Running method: %s", method)
-        disruption = infer_disruption(lesion_path, method=method)
+
+        if use_sparse and method != "threshold_fraction":
+            disruption = infer_disruption_sparse(lesion_path, method=method)
+        else:
+            disruption = infer_disruption(lesion_path, method=method)
         results[method] = disruption
 
     # --- Save outputs if requested ---

@@ -4,25 +4,29 @@ Cortico-nuclear projection map builder (Step 1).
 Creates a 3D volume in SUIT space where each voxel is labeled with its target
 deep cerebellar nucleus (or nuclei, with probabilities).
 
-Output: a 4D NIfTI in SUIT space with dimensions (X, Y, Z, 4), where the
-4th dimension represents probability of projection to:
-  [0] = fastigial
-  [1] = emboliform (anterior interposed)
-  [2] = globose (posterior interposed)
-  [3] = dentate
+Output: a 4D NIfTI in SUIT space with dimensions (X, Y, Z, 8), where the
+8th dimension represents probability of projection to bilateral nuclei:
+  [0] = left fastigial        [4] = right fastigial
+  [1] = left emboliform       [5] = right emboliform
+  [2] = left globose           [6] = right globose
+  [3] = left dentate           [7] = right dentate
 
 For each cortical voxel, the probabilities sum to 1.0.
 For non-cortex voxels (white matter, nuclei, outside cerebellum), all
 probabilities are 0.
 
 The mapping follows the Voogd zonal scheme:
-  - Vermis -> fastigial
-  - Paravermal lobules I-V -> emboliform
-  - Paravermal lobules VI-IX -> globose
-  - Lateral hemisphere anterior -> dentate (dorsal/motor)
-  - Lateral hemisphere Crus I/II -> dentate (ventral/nonmotor)
-  - Lateral hemisphere VIIb-IX -> dentate (intermediate)
-  - Flocculonodular (X) -> fastigial + vestibular
+  - Vermis -> fastigial (bilateral)
+  - Paravermal lobules I-V -> emboliform (ipsilateral)
+  - Paravermal lobules VI-IX -> globose (ipsilateral)
+  - Lateral hemisphere anterior -> dentate (ipsilateral, dorsal/motor)
+  - Lateral hemisphere Crus I/II -> dentate (ipsilateral, ventral/nonmotor)
+  - Lateral hemisphere VIIb-IX -> dentate (ipsilateral, intermediate)
+  - Flocculonodular (X) -> fastigial + vestibular (bilateral)
+
+Laterality is determined from the SUIT label name: labels starting with
+"Left" project ipsilaterally to left-side nuclei, "Right" to right-side
+nuclei, and "Vermis" labels split projections equally between both sides.
 
 Transitional zones are handled with sigmoid blending at boundaries.
 
@@ -58,23 +62,79 @@ from src.utils import (
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Nucleus constants
+# Nucleus constants (bilateral: 4 per hemisphere = 8 total)
 # ---------------------------------------------------------------------------
 
-NUCLEUS_NAMES = ["fastigial", "emboliform", "globose", "dentate"]
+# Unilateral nucleus types (used for the Voogd zonal probability tables)
+UNILATERAL_NUCLEUS_NAMES = ["fastigial", "emboliform", "globose", "dentate"]
+N_UNILATERAL = len(UNILATERAL_NUCLEUS_NAMES)
 
-NUCLEUS_INDEX = {
-    "fastigial": 0,
-    "emboliform": 1,   # anterior interposed
-    "globose": 2,       # posterior interposed
-    "dentate": 3,
+# Bilateral nucleus channels: left (0-3), right (4-7)
+NUCLEUS_NAMES = [
+    "left_fastigial", "left_emboliform", "left_globose", "left_dentate",
+    "right_fastigial", "right_emboliform", "right_globose", "right_dentate",
+]
+N_NUCLEI = len(NUCLEUS_NAMES)
+
+NUCLEUS_INDEX = {name: i for i, name in enumerate(NUCLEUS_NAMES)}
+
+# ---------------------------------------------------------------------------
+# Label laterality mapping
+# ---------------------------------------------------------------------------
+# Determined from SUIT atlas label names:
+#   "Left *"   -> "left"   (projects to left-side nuclei, indices 0-3)
+#   "Right *"  -> "right"  (projects to right-side nuclei, indices 4-7)
+#   "Vermis *" -> "vermis" (projects bilaterally, split 50/50)
+#
+# Labels 1-4 (I-IV, V) have no separate vermis label in SUIT; they are
+# assigned as left/right based on their label name.  Their midline voxels
+# receive high vermis zone weight via the sigmoid blending, which correctly
+# assigns them mostly to fastigial regardless of side.
+
+LABEL_LATERALITY = {
+    1: "left",    2: "right",                         # I-IV
+    3: "left",    4: "right",                         # V
+    5: "left",    6: "vermis",   7: "right",          # VI
+    8: "left",    9: "vermis",  10: "right",          # CrusI
+   11: "left",   12: "vermis",  13: "right",          # CrusII
+   14: "left",   15: "vermis",  16: "right",          # VIIb
+   17: "left",   18: "vermis",  19: "right",          # VIIIa
+   20: "left",   21: "vermis",  22: "right",          # VIIIb
+   23: "left",   24: "vermis",  25: "right",          # IX
+   26: "left",   27: "vermis",  28: "right",          # X
+   # Deep nuclei — not cortical, excluded from projection mapping
+   29: None, 30: None, 31: None, 32: None, 33: None, 34: None,
 }
 
-# Convenience aliases for indexing into the 4th dimension
-_FASTIGIAL = NUCLEUS_INDEX["fastigial"]
-_EMBOLIFORM = NUCLEUS_INDEX["emboliform"]
-_GLOBOSE = NUCLEUS_INDEX["globose"]
-_DENTATE = NUCLEUS_INDEX["dentate"]
+
+def _expand_bilateral(
+    unilateral_probs: np.ndarray,
+    laterality: str,
+) -> np.ndarray:
+    """
+    Expand a 4-element unilateral probability vector to 8-element bilateral.
+
+    Parameters
+    ----------
+    unilateral_probs : np.ndarray of shape (4,)
+        Probability vector [fastigial, emboliform, globose, dentate].
+    laterality : str
+        One of 'left', 'right', or 'vermis'.
+
+    Returns
+    -------
+    bilateral_probs : np.ndarray of shape (8,)
+        [left_F, left_E, left_G, left_D, right_F, right_E, right_G, right_D]
+    """
+    bilateral = np.zeros(N_NUCLEI, dtype=np.float32)
+    if laterality == "left":
+        bilateral[:N_UNILATERAL] = unilateral_probs
+    elif laterality == "right":
+        bilateral[N_UNILATERAL:] = unilateral_probs
+    elif laterality == "vermis":
+        bilateral[:N_UNILATERAL] = unilateral_probs * 0.5
+        bilateral[N_UNILATERAL:] = unilateral_probs * 0.5
+    return bilateral
 
 # ---------------------------------------------------------------------------
 # Lobule-to-zone mapping table (Assumption A1)
@@ -345,8 +405,9 @@ def compute_nuclear_probabilities(
 
     Returns
     -------
-    prob_map : np.ndarray of shape (*parc_data.shape, 4)
-        Probability of projection to each nucleus at every voxel.
+    prob_map : np.ndarray of shape (*parc_data.shape, 8)
+        Probability of projection to each bilateral nucleus at every voxel.
+        Indices 0-3 are left nuclei, 4-7 are right nuclei.
         Sums to 1.0 for cortical voxels; all zeros for non-cortical voxels.
     cortical_mask : np.ndarray of shape parc_data.shape, dtype bool
         Boolean mask identifying cortical voxels that received probabilities.
@@ -388,8 +449,8 @@ def compute_nuclear_probabilities(
     x_mm = mm_grid[..., 0]  # medial-lateral axis
     zone_weights = classify_zones(x_mm, cfg)
 
-    # --- Allocate output ---
-    prob_map = np.zeros((*shape, 4), dtype=np.float32)
+    # --- Allocate output (8 bilateral channels) ---
+    prob_map = np.zeros((*shape, N_NUCLEI), dtype=np.float32)
 
     # --- Assign nuclear target probabilities per voxel ---
     for lbl_int in sorted(cortical_labels):
@@ -400,20 +461,26 @@ def compute_nuclear_probabilities(
 
         group_key = label_to_group[lbl_int]
         group_probs = LOBULE_GROUP_PROBS[group_key]
+        laterality = LABEL_LATERALITY.get(lbl_int, "left")
 
         for zone_name in ("vermis", "paravermis", "lateral"):
             zone_w = zone_weights[zone_name][mask]  # (N_voxels,)
-            nuclear_probs = np.array(
+            unilateral_probs = np.array(
                 group_probs[zone_name], dtype=np.float32
             )  # (4,)
 
-            # Each voxel receives zone_weight * nuclear_probability_vector
-            contribution = zone_w[:, np.newaxis] * nuclear_probs[np.newaxis, :]
+            # Expand to bilateral (8,) based on label laterality
+            bilateral_probs = _expand_bilateral(
+                unilateral_probs, laterality
+            )  # (8,)
+
+            # Each voxel receives zone_weight * bilateral_probability_vector
+            contribution = zone_w[:, np.newaxis] * bilateral_probs[np.newaxis, :]
             prob_map[mask] += contribution
 
         logger.debug(
-            "  Label %d: %d voxels, group='%s'",
-            lbl_int, n_voxels, group_key,
+            "  Label %d: %d voxels, group='%s', laterality='%s'",
+            lbl_int, n_voxels, group_key, laterality,
         )
 
     # --- Normalize probabilities to sum to 1 at each voxel ---
@@ -445,8 +512,8 @@ def create_winner_take_all_map(
 
     Parameters
     ----------
-    prob_map : np.ndarray of shape (X, Y, Z, 4)
-        Per-voxel nuclear projection probabilities.
+    prob_map : np.ndarray of shape (X, Y, Z, 8)
+        Per-voxel bilateral nuclear projection probabilities.
     cortical_mask : np.ndarray of shape (X, Y, Z), dtype bool
         Boolean mask of cortical voxels.
 
@@ -454,7 +521,7 @@ def create_winner_take_all_map(
     -------
     winner_map : np.ndarray of shape (X, Y, Z), dtype float32
         Integer label of the winning nucleus at each cortical voxel
-        (0=fastigial, 1=emboliform, 2=globose, 3=dentate).
+        (0-7 indexing into NUCLEUS_NAMES).
         Non-cortical voxels are set to -1.
     """
     winner_map = np.full(prob_map.shape[:3], -1.0, dtype=np.float32)
@@ -581,13 +648,15 @@ def build_cortico_nuclear_map(
         if mask.any():
             avg_prob = prob_map[mask].mean(axis=0).tolist()
         else:
-            avg_prob = [0.0, 0.0, 0.0, 0.0]
+            avg_prob = [0.0] * N_NUCLEI
         parcel_meta.append({
             "label": int(lbl_int),
             "name": name,
             "group": LOBULE_ZONE_MAP.get(lbl_int, "unknown"),
+            "laterality": LABEL_LATERALITY.get(lbl_int, "unknown"),
             "avg_nuclear_prob": {
-                NUCLEUS_NAMES[i]: round(avg_prob[i], 4) for i in range(4)
+                NUCLEUS_NAMES[i]: round(avg_prob[i], 4)
+                for i in range(N_NUCLEI)
             },
             "n_voxels": int(mask.sum()),
         })
@@ -595,10 +664,15 @@ def build_cortico_nuclear_map(
     meta_path = output_dir / "cortico_nuclear_metadata.json"
     with open(meta_path, "w") as f:
         json.dump({
-            "description": "Cortico-nuclear projection probability map",
+            "description": (
+                "Cortico-nuclear projection probability map (bilateral). "
+                "Indices 0-3 are left nuclei, 4-7 are right nuclei."
+            ),
             "space": "SUIT",
+            "n_nuclei": N_NUCLEI,
             "nucleus_names": NUCLEUS_NAMES,
             "nucleus_indices": NUCLEUS_INDEX,
+            "unilateral_nucleus_names": UNILATERAL_NUCLEUS_NAMES,
             "config": cfg,
             "parcels": parcel_meta,
         }, f, indent=2)
