@@ -27,6 +27,7 @@ Test cases
 
 For each test, inference is run with all four aggregation methods:
 ``max``, ``mean``, ``weighted_sum``, ``threshold_fraction``.
+The ``max`` method is the default and is used for the primary evaluation.
 
 Outputs
 -------
@@ -519,7 +520,7 @@ def main() -> None:
 
             print(f"  Method={method:20s}  sum={scores.sum():.3f}  max={scores.max():.4f}")
 
-            # Evaluate only for the 'max' method (primary)
+            # Evaluate only for the 'max' method (primary/default)
             if method == "max":
                 eval_result = _evaluate_test(tc, scores, label_names, cortical_labels)
                 all_results.append(eval_result)

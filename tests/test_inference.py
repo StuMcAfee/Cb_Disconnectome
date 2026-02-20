@@ -1,63 +1,119 @@
 """
-Tests for the inference engine.
+Tests for the vertex-level inference engine.
 
-Uses small synthetic 4D occupancy volumes and binary lesion masks saved as
-temporary NIfTI files to verify the disruption inference pipeline.
+Uses small synthetic efferent density maps, vertex projection matrices, and
+binary lesion masks to verify the disruption inference pipeline.
 """
 
 import numpy as np
 import nibabel as nib
 import pytest
 
-from src.inference import infer_disruption, disruption_to_volume
+from src.inference import infer_disruption, _detect_direct_injury
 from src.utils import make_sphere_lesion
 
 
 # ---------------------------------------------------------------------------
-# Fixtures: synthetic data saved as temporary NIfTI files
+# Constants
 # ---------------------------------------------------------------------------
 
 VOLUME_SHAPE = (10, 10, 10)
-N_PARCELS = 5
+N_NUCLEI = 4
+N_VERTICES = 10
 AFFINE = np.eye(4)  # 1mm isotropic, origin at (0, 0, 0)
 
 
+# ---------------------------------------------------------------------------
+# Fixtures: synthetic data saved as temporary files
+# ---------------------------------------------------------------------------
+
 @pytest.fixture
-def occupancy_nifti(tmp_path):
+def efferent_nifti(tmp_path):
     """
-    Create a synthetic 4D occupancy volume (10x10x10x5).
+    Create a synthetic 4D efferent density volume (10x10x10x4).
 
-    Each parcel's occupancy map is a gradient along a different axis so
-    the parcels have distinct spatial profiles:
-      - parcel 0: gradient along x
-      - parcel 1: gradient along y
-      - parcel 2: gradient along z
-      - parcel 3: uniform 0.5
-      - parcel 4: uniform 0.0 (empty pathway)
+    Each nucleus has a distinct spatial profile:
+      - nucleus 0: gradient along x  (0 at x=0, 1 at x=9)
+      - nucleus 1: gradient along y
+      - nucleus 2: gradient along z
+      - nucleus 3: uniform 0.5
     """
-    data = np.zeros((*VOLUME_SHAPE, N_PARCELS), dtype=np.float32)
+    data = np.zeros((*VOLUME_SHAPE, N_NUCLEI), dtype=np.float32)
 
-    # Parcel 0: linearly increasing along x, range [0, 1]
     for i in range(VOLUME_SHAPE[0]):
         data[i, :, :, 0] = i / (VOLUME_SHAPE[0] - 1)
-
-    # Parcel 1: linearly increasing along y
     for j in range(VOLUME_SHAPE[1]):
         data[:, j, :, 1] = j / (VOLUME_SHAPE[1] - 1)
-
-    # Parcel 2: linearly increasing along z
     for k in range(VOLUME_SHAPE[2]):
         data[:, :, k, 2] = k / (VOLUME_SHAPE[2] - 1)
-
-    # Parcel 3: uniform 0.5
     data[:, :, :, 3] = 0.5
 
-    # Parcel 4: all zeros (no pathway)
-    # Already initialized to 0
+    path = tmp_path / "efferent_4d.nii.gz"
+    nib.save(nib.Nifti1Image(data, AFFINE), str(path))
+    return path
 
-    path = tmp_path / "occupancy.nii.gz"
-    img = nib.Nifti1Image(data, AFFINE)
-    nib.save(img, str(path))
+
+@pytest.fixture
+def vertex_projections(tmp_path):
+    """
+    Create synthetic vertex projections for 10 vertices.
+
+    Vertex projection profiles:
+      0: [1, 0, 0, 0]  (projects to nucleus 0 only)
+      1: [0, 1, 0, 0]  (projects to nucleus 1 only)
+      2: [0, 0, 1, 0]  (projects to nucleus 2 only)
+      3: [0, 0, 0, 1]  (projects to nucleus 3 only)
+      4: [0.25, 0.25, 0.25, 0.25]  (uniform)
+      5: [0.5, 0.5, 0, 0]
+      6: [0, 0, 0.5, 0.5]
+      7: [0.8, 0.1, 0.05, 0.05]
+      8: [0, 0, 0, 0]  (zero projection edge case)
+      9: [0.25, 0.25, 0.25, 0.25]
+
+    Vertex coordinates placed at known volume locations for direct
+    injury testing.  Pial and white coords are offset slightly.
+    """
+    proj = np.array([
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+        [0.25, 0.25, 0.25, 0.25],
+        [0.5, 0.5, 0.0, 0.0],
+        [0.0, 0.0, 0.5, 0.5],
+        [0.8, 0.1, 0.05, 0.05],
+        [0.0, 0.0, 0.0, 0.0],
+        [0.25, 0.25, 0.25, 0.25],
+    ], dtype=np.float32)
+
+    # Place vertices at specific locations inside the 10x10x10 volume.
+    # With identity affine, mm coords == voxel coords.
+    pial_coords = np.array([
+        [5.0, 5.0, 5.0],
+        [3.0, 3.0, 3.0],
+        [7.0, 7.0, 7.0],
+        [1.0, 1.0, 1.0],
+        [9.0, 9.0, 9.0],  # vertex 4: at corner
+        [2.0, 5.0, 5.0],
+        [5.0, 2.0, 5.0],
+        [5.0, 5.0, 2.0],
+        [0.0, 0.0, 0.0],
+        [4.0, 4.0, 4.0],
+    ], dtype=np.float32)
+
+    # White coords slightly offset (simulating ~0.5mm cortical thickness)
+    white_coords = pial_coords + 0.3
+
+    parcel_labels = np.ones(N_VERTICES, dtype=np.int32)
+
+    path = tmp_path / "vertex_projections.npz"
+    np.savez(
+        path,
+        projections=proj,
+        pial_coords=pial_coords,
+        white_coords=white_coords,
+        parcel_labels=parcel_labels,
+    )
     return path
 
 
@@ -66,8 +122,7 @@ def empty_lesion_nifti(tmp_path):
     """A lesion mask with all zeros (no lesion)."""
     data = np.zeros(VOLUME_SHAPE, dtype=np.float32)
     path = tmp_path / "empty_lesion.nii.gz"
-    img = nib.Nifti1Image(data, AFFINE)
-    nib.save(img, str(path))
+    nib.save(nib.Nifti1Image(data, AFFINE), str(path))
     return path
 
 
@@ -77,8 +132,7 @@ def single_voxel_lesion_nifti(tmp_path):
     data = np.zeros(VOLUME_SHAPE, dtype=np.float32)
     data[9, 9, 9] = 1.0
     path = tmp_path / "single_voxel_lesion.nii.gz"
-    img = nib.Nifti1Image(data, AFFINE)
-    nib.save(img, str(path))
+    nib.save(nib.Nifti1Image(data, AFFINE), str(path))
     return path
 
 
@@ -88,20 +142,28 @@ def block_lesion_nifti(tmp_path):
     data = np.zeros(VOLUME_SHAPE, dtype=np.float32)
     data[7:10, 7:10, 7:10] = 1.0
     path = tmp_path / "block_lesion.nii.gz"
-    img = nib.Nifti1Image(data, AFFINE)
-    nib.save(img, str(path))
+    nib.save(nib.Nifti1Image(data, AFFINE), str(path))
+    return path
+
+
+@pytest.fixture
+def cortical_lesion_nifti(tmp_path):
+    """A lesion that overlaps vertex 4's location (at 9,9,9)."""
+    data = np.zeros(VOLUME_SHAPE, dtype=np.float32)
+    data[9, 9, 9] = 1.0
+    path = tmp_path / "cortical_lesion.nii.gz"
+    nib.save(nib.Nifti1Image(data, AFFINE), str(path))
     return path
 
 
 @pytest.fixture
 def mismatched_affine_lesion_nifti(tmp_path):
-    """A lesion mask whose affine does NOT match the occupancy volume."""
+    """A lesion mask whose affine does NOT match the efferent volume."""
     data = np.zeros(VOLUME_SHAPE, dtype=np.float32)
     data[5, 5, 5] = 1.0
-    bad_affine = np.diag([2.0, 2.0, 2.0, 1.0])  # 2mm isotropic
+    bad_affine = np.diag([2.0, 2.0, 2.0, 1.0])
     path = tmp_path / "mismatched_lesion.nii.gz"
-    img = nib.Nifti1Image(data, bad_affine)
-    nib.save(img, str(path))
+    nib.save(nib.Nifti1Image(data, bad_affine), str(path))
     return path
 
 
@@ -110,139 +172,161 @@ def mismatched_affine_lesion_nifti(tmp_path):
 # ---------------------------------------------------------------------------
 
 class TestInferDisruption:
-    """Tests for the core disruption inference function."""
+    """Tests for the core vertex-level disruption inference."""
 
     def test_infer_disruption_empty_lesion(
-        self, occupancy_nifti, empty_lesion_nifti
+        self, efferent_nifti, vertex_projections, empty_lesion_nifti
     ):
-        """An empty lesion (all zeros) should return all-zero disruption."""
+        """An empty lesion should return all-zero disruption."""
         result = infer_disruption(
-            occupancy_nifti, empty_lesion_nifti, method="max"
+            empty_lesion_nifti, efferent_nifti, vertex_projections, method="max"
         )
         np.testing.assert_allclose(result, 0.0)
+        assert result.shape == (N_VERTICES,)
 
     def test_infer_disruption_max_method(
-        self, occupancy_nifti, single_voxel_lesion_nifti
+        self, efferent_nifti, vertex_projections, single_voxel_lesion_nifti
     ):
         """
-        Max method with single voxel at (9,9,9) should return the occupancy
-        values at that location.
+        Max method with a single voxel at (9,9,9).
 
-        For our synthetic data:
-          parcel 0 at x=9: 9/9 = 1.0
-          parcel 1 at y=9: 9/9 = 1.0
-          parcel 2 at z=9: 9/9 = 1.0
-          parcel 3: 0.5
-          parcel 4: 0.0
+        Efferent density at (9,9,9):
+          nucleus 0: 9/9 = 1.0  (x-gradient)
+          nucleus 1: 9/9 = 1.0  (y-gradient)
+          nucleus 2: 9/9 = 1.0  (z-gradient)
+          nucleus 3: 0.5         (uniform)
+
+        With only 1 lesion voxel, scores = E @ P.T where E = [1, 1, 1, 0.5]:
+          vertex 0 (proj [1,0,0,0]): 1*1 + 0*1 + 0*1 + 0*0.5 = 1.0
+          vertex 1 (proj [0,1,0,0]): 1.0
+          vertex 2 (proj [0,0,1,0]): 1.0
+          vertex 3 (proj [0,0,0,1]): 0.5
+          vertex 4 (proj [.25,.25,.25,.25]): 0.25+0.25+0.25+0.125 = 0.875
+          vertex 8 (proj [0,0,0,0]): 0.0
         """
         result = infer_disruption(
-            occupancy_nifti, single_voxel_lesion_nifti, method="max"
+            single_voxel_lesion_nifti, efferent_nifti, vertex_projections,
+            method="max",
         )
-        expected = np.array([1.0, 1.0, 1.0, 0.5, 0.0])
-        np.testing.assert_allclose(result, expected, atol=1e-6)
+        assert result.shape == (N_VERTICES,)
+
+        # Vertex 4 is at (9,9,9) so direct injury sets it to 1.0
+        assert result[4] == pytest.approx(1.0)
+
+        # Vertex 0: projects only to nucleus 0
+        assert result[0] == pytest.approx(1.0, abs=1e-5)
+        # Vertex 3: projects only to nucleus 3 (uniform 0.5)
+        assert result[3] == pytest.approx(0.5, abs=1e-5)
+        # Vertex 8: zero projection -> 0.0
+        assert result[8] == pytest.approx(0.0, abs=1e-5)
 
     def test_infer_disruption_mean_method(
-        self, occupancy_nifti, block_lesion_nifti
+        self, efferent_nifti, vertex_projections, block_lesion_nifti
     ):
-        """
-        Mean method should return the average occupancy across lesion voxels.
-
-        The 3x3x3 block at (7:10, 7:10, 7:10) contains 27 voxels.
-        For parcel 0 (x-gradient): x values are 7,8,9 -> occ = 7/9, 8/9, 9/9
-        averaged over the 3 x-slices (y and z don't matter for parcel 0):
-        mean = (7+8+9) / (3*9) = 24/27 = 8/9 ~ 0.8889
-        """
+        """Mean method should average scores across the 27 lesion voxels."""
         result = infer_disruption(
-            occupancy_nifti, block_lesion_nifti, method="mean"
+            block_lesion_nifti, efferent_nifti, vertex_projections, method="mean"
         )
+        assert result.shape == (N_VERTICES,)
 
-        assert result.shape == (N_PARCELS,)
+        # Vertex 3 projects only to nucleus 3 (uniform 0.5).
+        # All lesion voxels have nucleus 3 density = 0.5.
+        # score for each voxel: 1 * 0.5 = 0.5, mean = 0.5
+        assert result[3] == pytest.approx(0.5, abs=1e-5)
 
-        # Parcel 0: mean of x-gradient over block
-        expected_p0 = np.mean([i / 9.0 for i in [7, 8, 9]])
-        np.testing.assert_allclose(result[0], expected_p0, atol=1e-5)
+        # Vertex 8: zero projection -> 0.0
+        assert result[8] == pytest.approx(0.0, abs=1e-5)
 
-        # Parcel 3: uniform 0.5, mean should be 0.5
-        np.testing.assert_allclose(result[3], 0.5, atol=1e-5)
-
-        # Parcel 4: all zeros
-        np.testing.assert_allclose(result[4], 0.0, atol=1e-5)
+        # All values in [0, 1]
+        assert np.all(result >= 0.0)
+        assert np.all(result <= 1.0 + 1e-6)
 
     def test_infer_disruption_weighted_sum_method(
-        self, occupancy_nifti, block_lesion_nifti
+        self, efferent_nifti, vertex_projections, block_lesion_nifti
     ):
-        """
-        Weighted sum should be normalized to [0, 1].
-
-        The weighted sum accumulates occupancy across all lesion voxels,
-        then normalizes so the result falls in [0, 1].
-        """
+        """Weighted sum should be normalized to [0, 1]."""
         result = infer_disruption(
-            occupancy_nifti, block_lesion_nifti, method="weighted_sum"
+            block_lesion_nifti, efferent_nifti, vertex_projections,
+            method="weighted_sum",
         )
-
-        assert result.shape == (N_PARCELS,)
-
-        # All values must be in [0, 1]
+        assert result.shape == (N_VERTICES,)
         assert np.all(result >= 0.0)
-        assert np.all(result <= 1.0 + 1e-7)
-
-        # Parcel 4 (empty pathway) should still be 0
-        np.testing.assert_allclose(result[4], 0.0, atol=1e-7)
+        assert np.all(result <= 1.0 + 1e-6)
 
     def test_infer_disruption_threshold_fraction_method(
-        self, occupancy_nifti, block_lesion_nifti
+        self, efferent_nifti, vertex_projections, block_lesion_nifti
     ):
-        """
-        Threshold fraction method returns the fraction of the pathway
-        that is intersected by the lesion.
-
-        For each parcel, this is the number of lesion voxels where
-        occupancy > 0 divided by the total number of voxels where
-        occupancy > 0 in the whole volume.
-        """
+        """Threshold fraction values should be in [0, 1]."""
         result = infer_disruption(
-            occupancy_nifti, block_lesion_nifti, method="threshold_fraction"
+            block_lesion_nifti, efferent_nifti, vertex_projections,
+            method="threshold_fraction",
         )
-
-        assert result.shape == (N_PARCELS,)
-
-        # All values must be in [0, 1]
+        assert result.shape == (N_VERTICES,)
         assert np.all(result >= 0.0)
-        assert np.all(result <= 1.0 + 1e-7)
+        assert np.all(result <= 1.0 + 1e-6)
 
-        # Parcel 4 (empty pathway) should be 0
-        np.testing.assert_allclose(result[4], 0.0, atol=1e-7)
-
-        # Parcel 3 (uniform 0.5 everywhere): 27 lesion voxels out of 1000 total
-        # that have occupancy > 0 (all 1000 voxels have occ = 0.5 > 0)
-        expected_p3 = 27.0 / (10 * 10 * 10)
-        np.testing.assert_allclose(result[3], expected_p3, atol=1e-5)
+        # Vertex 8 has zero projection -> 0.0
+        assert result[8] == pytest.approx(0.0, abs=1e-6)
 
     def test_infer_disruption_shape(
-        self, occupancy_nifti, single_voxel_lesion_nifti
+        self, efferent_nifti, vertex_projections, single_voxel_lesion_nifti
     ):
-        """Output shape should match the number of parcels."""
+        """Output shape should match the number of vertices."""
         result = infer_disruption(
-            occupancy_nifti, single_voxel_lesion_nifti, method="max"
+            single_voxel_lesion_nifti, efferent_nifti, vertex_projections,
+            method="max",
         )
-        assert result.shape == (N_PARCELS,)
+        assert result.shape == (N_VERTICES,)
+
+    def test_infer_disruption_invalid_method(
+        self, efferent_nifti, vertex_projections, single_voxel_lesion_nifti
+    ):
+        """Invalid method should raise ValueError."""
+        with pytest.raises(ValueError, match="Unknown aggregation method"):
+            infer_disruption(
+                single_voxel_lesion_nifti, efferent_nifti, vertex_projections,
+                method="invalid",
+            )
 
 
 # ---------------------------------------------------------------------------
-# Tests: disruption_to_volume
+# Tests: direct injury detection
 # ---------------------------------------------------------------------------
 
-class TestDisruptionToVolume:
-    """Tests for mapping disruption scores back to a spatial volume."""
+class TestDirectInjury:
+    """Tests for direct cortical injury detection."""
 
-    def test_disruption_to_volume_shape(self, occupancy_nifti):
-        """Output volume should have the correct 3D spatial shape."""
-        disruption_scores = np.array([0.8, 0.6, 0.4, 0.2, 0.0])
-        result = disruption_to_volume(disruption_scores, occupancy_nifti)
+    def test_direct_injury_vertex_overlap(self):
+        """Vertex at lesion location should be detected as injured."""
+        lesion_data = np.zeros(VOLUME_SHAPE, dtype=np.float32)
+        lesion_data[5, 5, 5] = 1.0
 
-        # Result should be a 3D volume matching the spatial dimensions
-        assert result.shape == VOLUME_SHAPE
+        pial_coords = np.array([
+            [5.0, 5.0, 5.0],  # right on the lesion
+            [0.0, 0.0, 0.0],  # far away
+        ], dtype=np.float32)
+        white_coords = pial_coords + 0.2
+
+        injured = _detect_direct_injury(
+            lesion_data, AFFINE, pial_coords, white_coords,
+        )
+        assert injured[0] == True
+        assert injured[1] == False
+
+    def test_direct_injury_no_lesion(self):
+        """Empty lesion should not injure any vertex."""
+        lesion_data = np.zeros(VOLUME_SHAPE, dtype=np.float32)
+
+        pial_coords = np.array([
+            [5.0, 5.0, 5.0],
+            [3.0, 3.0, 3.0],
+        ], dtype=np.float32)
+        white_coords = pial_coords + 0.2
+
+        injured = _detect_direct_injury(
+            lesion_data, AFFINE, pial_coords, white_coords,
+        )
+        assert not injured.any()
 
 
 # ---------------------------------------------------------------------------
@@ -253,19 +337,20 @@ class TestAffineMismatch:
     """Tests for spatial alignment validation."""
 
     def test_affine_mismatch_raises(
-        self, occupancy_nifti, mismatched_affine_lesion_nifti
+        self, efferent_nifti, vertex_projections, mismatched_affine_lesion_nifti
     ):
-        """Mismatched affines between occupancy and lesion should raise."""
-        with pytest.raises(AssertionError):
+        """Mismatched affines between efferent and lesion should raise."""
+        with pytest.raises(ValueError):
             infer_disruption(
-                occupancy_nifti,
                 mismatched_affine_lesion_nifti,
+                efferent_nifti,
+                vertex_projections,
                 method="max",
             )
 
 
 # ---------------------------------------------------------------------------
-# Tests: make_sphere_lesion (from src.utils)
+# Tests: make_sphere_lesion (from src.utils — unchanged)
 # ---------------------------------------------------------------------------
 
 class TestMakeSphereLesion:
@@ -276,52 +361,26 @@ class TestMakeSphereLesion:
         """Create a small reference NIfTI for sphere lesion generation."""
         data = np.zeros((20, 20, 20), dtype=np.float32)
         path = tmp_path / "reference.nii.gz"
-        affine = np.eye(4)
-        img = nib.Nifti1Image(data, affine)
-        nib.save(img, str(path))
+        nib.save(nib.Nifti1Image(data, np.eye(4)), str(path))
         return path
 
     def test_make_sphere_lesion_shape(self, reference_nifti):
         """Sphere lesion should have correct shape and be binary."""
-        center_mm = (10.0, 10.0, 10.0)
-        radius_mm = 3.0
-
-        result_img = make_sphere_lesion(center_mm, radius_mm, reference_nifti)
+        result_img = make_sphere_lesion((10.0, 10.0, 10.0), 3.0, reference_nifti)
         result_data = result_img.get_fdata()
-
-        # Shape matches reference
         assert result_data.shape == (20, 20, 20)
-
-        # Binary: only 0s and 1s
         unique_vals = np.unique(result_data)
         assert all(v in [0.0, 1.0] for v in unique_vals)
-
-        # There should be some nonzero voxels (the sphere is inside the volume)
         assert result_data.sum() > 0
 
     def test_make_sphere_lesion_center(self, reference_nifti):
         """The center voxel of the sphere should be non-zero."""
-        center_mm = (10.0, 10.0, 10.0)
-        radius_mm = 3.0
-
-        result_img = make_sphere_lesion(center_mm, radius_mm, reference_nifti)
-        result_data = result_img.get_fdata()
-
-        # With identity affine, mm coords = voxel coords
-        # The center voxel at (10, 10, 10) should be inside the sphere
-        assert result_data[10, 10, 10] == 1.0
+        result_img = make_sphere_lesion((10.0, 10.0, 10.0), 3.0, reference_nifti)
+        assert result_img.get_fdata()[10, 10, 10] == 1.0
 
     def test_make_sphere_lesion_radius(self, reference_nifti):
         """Voxels far from center should be outside the sphere."""
-        center_mm = (10.0, 10.0, 10.0)
-        radius_mm = 2.0
-
-        result_img = make_sphere_lesion(center_mm, radius_mm, reference_nifti)
+        result_img = make_sphere_lesion((10.0, 10.0, 10.0), 2.0, reference_nifti)
         result_data = result_img.get_fdata()
-
-        # A corner voxel far from center should be 0
         assert result_data[0, 0, 0] == 0.0
-
-        # A voxel just outside the radius should be 0
-        # Distance from (10,10,10) to (10,10,13) = 3mm > 2mm radius
         assert result_data[10, 10, 13] == 0.0

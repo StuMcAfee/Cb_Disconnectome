@@ -1,34 +1,32 @@
 """
-Build the 4D pathway occupancy volume (Step 3 — core integration).
+Build vertex-level nuclear projection data (Step 3 — core integration).
 
-Combines the cortical parcellation (Step 1) with the efferent pathway maps
-(Step 2) to create the 4D pathway occupancy volume that is the main data
-product of the cerebellar disconnectome model.
+Combines the cortico-nuclear probability map (Step 1) with the SUIT surface
+meshes to create per-vertex nuclear projection probabilities.  This gives
+vertex-level resolution (28,935 surface vertices) instead of the former
+28-parcel lobule-level approach.
 
 Pipeline
 --------
-1. Build a subdivided parcellation by splitting each SUIT lobule into five
-   medial-lateral zones (vermis, paravermis_L, paravermis_R, hemisphere_L,
-   hemisphere_R), yielding roughly 60-80 parcels.
-2. Load the cortico-nuclear probability map (from Step 1) and compute each
-   parcel's average nuclear-target probability vector.
-3. Load the nuclear efferent density maps (from Step 2).
-4. For each parcel k:
-       a. Weight the nuclear efferent density maps by parcel k's projection
-          probabilities.
-       b. Add the cortical voxels of parcel k as a "direct injury" zone
-          (probability = 1.0).
-       c. Store the resulting 3D map as volume k of the 4D output.
-
-Output shape: (X, Y, Z, N_parcels)
-Each 3D volume represents the probability that a lesion at voxel (x, y, z)
-disrupts cortical parcel k.
+1. Load SUIT pial and white-matter surface GIfTI files (28,935 matched
+   vertices).
+2. Load the cortico-nuclear probability map from Step 1 (X, Y, Z, 4).
+3. For each vertex, sample the cortico-nuclear map at 6 depths between the
+   pial and white surfaces, then average to produce a (4,) nuclear projection
+   probability vector.
+4. Determine each vertex's SUIT lobular label for summary/reporting.
+5. Load and combine the four per-nucleus efferent density maps (Step 2) into
+   a single 4D NIfTI in SUIT space for use at inference time.
 
 Outputs
 -------
-- data/final/pathway_occupancy_4d.nii.gz         — main 4D volume
-- data/final/parcellation_subdivided_SUIT.nii.gz  — subdivided parcellation
-- data/final/pathway_occupancy_metadata.json      — JSON metadata sidecar
+- data/final/vertex_projections.npz
+      projections  (28935, 4)   nuclear projection probabilities
+      pial_coords  (28935, 3)   pial surface coordinates (SUIT mm)
+      white_coords (28935, 3)   white surface coordinates (SUIT mm)
+      parcel_labels (28935,)    SUIT lobular label per vertex (1-28; 0=outside)
+- data/final/vertex_metadata.json         — JSON metadata sidecar
+- data/final/efferent_density_suit_4d.nii.gz — combined efferent density maps
 
 Usage:
     python -m src.build_4d_nifti [--config config.json]
@@ -47,9 +45,7 @@ from src.utils import (
     ATLAS_DIR,
     DATA_FINAL,
     DATA_INTERIM,
-    classify_zones,
     get_config,
-    get_mm_coordinate_grid,
     load_nifti,
     save_metadata,
     save_nifti,
@@ -62,17 +58,8 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 NUCLEUS_NAMES = ["fastigial", "emboliform", "globose", "dentate"]
 N_NUCLEI = len(NUCLEUS_NAMES)
 
-# Standard SUIT lobule names used for parcellation.  The ordering follows the
-# Diedrichsen cerebellar atlas convention.
-SUIT_LOBULE_NAMES = [
-    "I-IV", "V", "VI", "CrusI", "CrusII",
-    "VIIb", "VIIIa", "VIIIb", "IX", "X",
-]
-
-# Default label-to-lobule mapping for the SUIT anatomical atlas.
-# Keys are integer labels in the atlas NIfTI; values are (lobule, side) tuples
-# where side is 'L', 'R', or 'V' (vermis).
-# Labels 29-34 are deep nuclei and are excluded from cortical parcellation.
+# Default label-to-name mapping for the 28 cortical labels in the SUIT
+# anatomical atlas.  Labels 29-34 are deep nuclei and are excluded.
 DEFAULT_SUIT_LABELS: dict[int, tuple[str, str]] = {
     1:  ("I-IV",   "L"),
     2:  ("I-IV",   "R"),
@@ -104,17 +91,180 @@ DEFAULT_SUIT_LABELS: dict[int, tuple[str, str]] = {
     28: ("X",      "R"),
 }
 
+N_CORTICAL_PARCELS = len(DEFAULT_SUIT_LABELS)  # 28
+
+# Depth fractions for sampling between pial and white surfaces
+# (matches SUITPy vol_to_surf defaults)
+DEFAULT_DEPTHS = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+
 
 # ---------------------------------------------------------------------------
-# Subdivided parcellation
+# SUIT surface loading
+# ---------------------------------------------------------------------------
+
+def _find_suitpy_surfaces_dir() -> Path:
+    """Locate the SUITPy surfaces directory."""
+    try:
+        import SUITPy as suit
+        surfaces_dir = Path(suit.__file__).parent / "surfaces"
+    except ImportError:
+        # Fallback: search common locations
+        fallback = Path("/tmp/suitpy_download")
+        candidates = list(fallback.rglob("surfaces/PIAL_SUIT.surf.gii"))
+        if candidates:
+            surfaces_dir = candidates[0].parent
+        else:
+            raise FileNotFoundError(
+                "SUITPy not installed and no surfaces found. "
+                "Install with: pip install git+https://github.com/"
+                "DiedrichsenLab/SUITPy.git"
+            )
+    if not surfaces_dir.exists():
+        raise FileNotFoundError(f"SUITPy surfaces directory not found: {surfaces_dir}")
+    return surfaces_dir
+
+
+def load_suit_surfaces(space: str = "SUIT") -> tuple[np.ndarray, np.ndarray]:
+    """
+    Load matched pial and white-matter surfaces from SUITPy.
+
+    Parameters
+    ----------
+    space : str
+        Coordinate space: 'SUIT', 'MNISymC', 'FSL', or 'SPM'.
+
+    Returns
+    -------
+    pial_coords : np.ndarray of shape (N_vertices, 3)
+        Pial surface vertex coordinates in mm.
+    white_coords : np.ndarray of shape (N_vertices, 3)
+        White-matter surface vertex coordinates in mm.
+    """
+    surfaces_dir = _find_suitpy_surfaces_dir()
+
+    pial_path = surfaces_dir / f"PIAL_{space}.surf.gii"
+    white_path = surfaces_dir / f"WHITE_{space}.surf.gii"
+
+    if not pial_path.exists():
+        raise FileNotFoundError(f"Pial surface not found: {pial_path}")
+    if not white_path.exists():
+        raise FileNotFoundError(f"White surface not found: {white_path}")
+
+    pial_gii = nib.load(str(pial_path))
+    white_gii = nib.load(str(white_path))
+
+    pial_coords = pial_gii.darrays[0].data.astype(np.float64)
+    white_coords = white_gii.darrays[0].data.astype(np.float64)
+
+    n_pial = pial_coords.shape[0]
+    n_white = white_coords.shape[0]
+    if n_pial != n_white:
+        raise ValueError(
+            f"Vertex count mismatch: pial has {n_pial}, white has {n_white}."
+        )
+
+    logger.info(
+        "Loaded SUIT surfaces (%s space): %d vertices", space, n_pial,
+    )
+    return pial_coords, white_coords
+
+
+# ---------------------------------------------------------------------------
+# Volume sampling at vertex locations
+# ---------------------------------------------------------------------------
+
+def sample_volume_at_vertices(
+    volume_data: np.ndarray,
+    affine: np.ndarray,
+    pial_coords: np.ndarray,
+    white_coords: np.ndarray,
+    depths: tuple[float, ...] = DEFAULT_DEPTHS,
+) -> np.ndarray:
+    """
+    Sample a 3D or 4D volume at vertex locations using depth interpolation.
+
+    For each vertex, computes 3D coordinates at multiple depths between the
+    pial and white surfaces, converts to voxel indices, samples the volume,
+    and averages across depths.
+
+    Parameters
+    ----------
+    volume_data : np.ndarray of shape (X, Y, Z) or (X, Y, Z, C)
+        Volume to sample.
+    affine : np.ndarray of shape (4, 4)
+        Affine mapping voxel indices to mm coordinates.
+    pial_coords : np.ndarray of shape (N_vertices, 3)
+        Pial surface coordinates in mm.
+    white_coords : np.ndarray of shape (N_vertices, 3)
+        White surface coordinates in mm.
+    depths : tuple of float
+        Fractional depths between pial (0) and white (1) surfaces.
+
+    Returns
+    -------
+    vertex_values : np.ndarray of shape (N_vertices,) or (N_vertices, C)
+        Sampled values averaged across depths.
+    """
+    n_vertices = pial_coords.shape[0]
+    is_4d = volume_data.ndim == 4
+    n_channels = volume_data.shape[3] if is_4d else 1
+    spatial_shape = np.array(volume_data.shape[:3])
+
+    inv_affine = np.linalg.inv(affine)
+
+    accumulated = np.zeros((n_vertices, n_channels), dtype=np.float64)
+    n_valid = np.zeros(n_vertices, dtype=np.int32)
+
+    for depth in depths:
+        # Interpolate between pial and white surface coordinates
+        coords_mm = (1.0 - depth) * pial_coords + depth * white_coords
+
+        # Convert mm to voxel indices
+        ones = np.ones((n_vertices, 1), dtype=np.float64)
+        homogeneous = np.hstack([coords_mm, ones])
+        voxel_float = (inv_affine @ homogeneous.T).T[:, :3]
+        voxel_idx = np.round(voxel_float).astype(int)
+
+        # Check bounds
+        in_bounds = (
+            np.all(voxel_idx >= 0, axis=1)
+            & (voxel_idx[:, 0] < spatial_shape[0])
+            & (voxel_idx[:, 1] < spatial_shape[1])
+            & (voxel_idx[:, 2] < spatial_shape[2])
+        )
+
+        valid_idx = voxel_idx[in_bounds]
+        if valid_idx.shape[0] == 0:
+            continue
+
+        if is_4d:
+            values = volume_data[
+                valid_idx[:, 0], valid_idx[:, 1], valid_idx[:, 2], :
+            ]
+        else:
+            values = volume_data[
+                valid_idx[:, 0], valid_idx[:, 1], valid_idx[:, 2]
+            ].reshape(-1, 1)
+
+        accumulated[in_bounds] += values
+        n_valid[in_bounds] += 1
+
+    # Average across depths (avoid division by zero)
+    n_valid_safe = np.maximum(n_valid, 1)
+    vertex_values = (accumulated / n_valid_safe[:, np.newaxis]).astype(np.float32)
+
+    if not is_4d:
+        vertex_values = vertex_values.squeeze(axis=1)
+
+    return vertex_values
+
+
+# ---------------------------------------------------------------------------
+# SUIT parcellation loader (for per-vertex lobule labels)
 # ---------------------------------------------------------------------------
 
 def _load_suit_parcellation(config: dict) -> tuple[np.ndarray, np.ndarray, nib.Nifti1Header]:
-    """
-    Locate and load the SUIT anatomical lobular parcellation NIfTI.
-
-    Returns (data, affine, header).
-    """
+    """Locate and load the SUIT anatomical lobular parcellation NIfTI."""
     candidates = list(ATLAS_DIR.rglob("*Anatom*space-SUIT*dseg.nii*"))
     if not candidates:
         raise FileNotFoundError(
@@ -126,306 +276,8 @@ def _load_suit_parcellation(config: dict) -> tuple[np.ndarray, np.ndarray, nib.N
     return load_nifti(parc_path, dtype=int)
 
 
-def build_subdivided_parcellation(
-    config: dict | None = None,
-) -> tuple[np.ndarray, list[dict]]:
-    """
-    Create the subdivided parcellation from SUIT lobular atlas + zone
-    classification.
-
-    Each SUIT lobule is split into up to five medial-lateral subdivisions:
-        vermis, paravermis_L, paravermis_R, hemisphere_L, hemisphere_R
-
-    The subdivision uses soft (sigmoid) zone weights and assigns each voxel
-    to the zone with the highest membership weight.  Voxels that originally
-    belong to left-lateralised SUIT labels keep their left side; similarly
-    for right.  Vermis labels can be split into all five zones.
-
-    Parameters
-    ----------
-    config : dict, optional
-        Model configuration overrides (zone boundary parameters).
-
-    Returns
-    -------
-    parcellation_data : np.ndarray of shape (X, Y, Z), dtype int32
-        Integer label volume where each unique nonzero value corresponds
-        to one subdivided parcel.
-    parcel_info_list : list of dict
-        One entry per parcel with keys:
-        'index'      — integer label in parcellation_data (1-based)
-        'name'       — human-readable parcel name (e.g. "CrusI_hemisphere_L")
-        'lobule'     — SUIT lobule name
-        'zone'       — one of 'vermis', 'paravermis', 'hemisphere'
-        'hemisphere' — 'L', 'R', or 'midline'
-    """
-    cfg = get_config(config)
-    parc_data, affine, header = _load_suit_parcellation(cfg)
-    shape = parc_data.shape[:3]
-
-    # Build mm coordinate grid to classify medial-lateral zones
-    mm_grid = get_mm_coordinate_grid(shape, affine)
-    x_mm = mm_grid[..., 0]  # medial-lateral axis in SUIT space
-
-    # Soft zone membership weights
-    zone_weights = classify_zones(x_mm, cfg)
-
-    # Determine hemisphere from sign of x (SUIT: negative = right, positive = left
-    # by neurological convention, but the atlas labels already encode side).
-    # We use x_mm sign to split vermis labels and to assign paravermis/hemisphere
-    # side for lateralised labels.
-    is_left = x_mm >= 0  # SUIT convention: x >= 0 is anatomical left
-
-    # Zone definitions for subdivision
-    # For each zone type we record (zone_name_prefix, hemisphere_label)
-    ZONE_DEFS = [
-        ("vermis",      "midline"),
-        ("paravermis_L", "L"),
-        ("paravermis_R", "R"),
-        ("hemisphere_L", "L"),
-        ("hemisphere_R", "R"),
-    ]
-
-    # Allocate output
-    subdiv_data = np.zeros(shape, dtype=np.int32)
-    parcel_info_list: list[dict] = []
-    parcel_idx = 0  # will be incremented to 1-based
-
-    for lbl_int, (lobule, side) in sorted(DEFAULT_SUIT_LABELS.items()):
-        lbl_mask = parc_data == lbl_int
-        if not lbl_mask.any():
-            continue
-
-        # Determine which zones are valid for this label based on its side.
-        # - 'V' (vermis) labels can become: vermis, paravermis_L/R
-        # - 'L' labels can become: vermis (near midline), paravermis_L, hemisphere_L
-        # - 'R' labels can become: vermis (near midline), paravermis_R, hemisphere_R
-        for zone_name, hemi_label in ZONE_DEFS:
-            # Determine the zone weight array for this subdivision
-            if zone_name == "vermis":
-                zone_w = zone_weights["vermis"]
-            elif zone_name.startswith("paravermis"):
-                zone_w = zone_weights["paravermis"]
-            else:  # hemisphere
-                zone_w = zone_weights["lateral"]
-
-            # Determine side constraint
-            if zone_name.endswith("_L"):
-                side_mask = is_left
-            elif zone_name.endswith("_R"):
-                side_mask = ~is_left
-            else:
-                # vermis — no side constraint
-                side_mask = np.ones(shape, dtype=bool)
-
-            # Filter by original atlas label side compatibility
-            if side == "L" and hemi_label == "R":
-                continue  # left atlas label cannot produce right-side parcels
-            if side == "R" and hemi_label == "L":
-                continue  # right atlas label cannot produce left-side parcels
-            if side == "L" and hemi_label == "midline":
-                # Left label can contribute to vermis only for voxels near midline
-                pass
-            if side == "R" and hemi_label == "midline":
-                pass
-            if side == "V" and hemi_label in ("L", "R"):
-                # Vermis label can extend into paravermis on either side
-                pass
-
-            # The candidate voxels are those in the atlas label AND on the
-            # correct side AND where the zone weight is the dominant zone.
-            candidate = lbl_mask & side_mask
-
-            if not candidate.any():
-                continue
-
-            # Use winner-take-all among the three basic zones (vermis,
-            # paravermis, lateral) to assign each voxel to exactly one zone.
-            # Then intersect with the side constraint.
-            if zone_name == "vermis":
-                winner_mask = (
-                    (zone_weights["vermis"] >= zone_weights["paravermis"])
-                    & (zone_weights["vermis"] >= zone_weights["lateral"])
-                )
-            elif zone_name.startswith("paravermis"):
-                winner_mask = (
-                    (zone_weights["paravermis"] > zone_weights["vermis"])
-                    & (zone_weights["paravermis"] >= zone_weights["lateral"])
-                )
-            else:
-                winner_mask = (
-                    (zone_weights["lateral"] > zone_weights["vermis"])
-                    & (zone_weights["lateral"] > zone_weights["paravermis"])
-                )
-
-            final_mask = candidate & winner_mask
-            if not final_mask.any():
-                continue
-
-            parcel_idx += 1
-            subdiv_data[final_mask] = parcel_idx
-
-            parcel_name = f"{lobule}_{zone_name}"
-            zone_base = zone_name.split("_")[0]  # vermis / paravermis / hemisphere
-            parcel_info_list.append({
-                "index": parcel_idx,
-                "name": parcel_name,
-                "lobule": lobule,
-                "zone": zone_base,
-                "hemisphere": hemi_label,
-            })
-
-            n_voxels = int(final_mask.sum())
-            logger.info(
-                "  Parcel %3d: %-28s  (%d voxels)",
-                parcel_idx, parcel_name, n_voxels,
-            )
-
-    logger.info(
-        "Subdivided parcellation complete: %d parcels from %d lobule labels.",
-        parcel_idx, len(DEFAULT_SUIT_LABELS),
-    )
-
-    # Save the subdivided parcellation NIfTI
-    out_path = DATA_FINAL / "parcellation_subdivided_SUIT.nii.gz"
-    save_nifti(subdiv_data.astype(np.int32), affine, out_path)
-    logger.info("Saved subdivided parcellation: %s", out_path)
-
-    return subdiv_data, parcel_info_list
-
-
 # ---------------------------------------------------------------------------
-# Nuclear projection probabilities per parcel
-# ---------------------------------------------------------------------------
-
-def compute_parcel_nuclear_probs(
-    parcellation_data: np.ndarray,
-    cortico_nuclear_map: np.ndarray,
-) -> np.ndarray:
-    """
-    For each parcel, compute the average cortico-nuclear probability vector.
-
-    Parameters
-    ----------
-    parcellation_data : np.ndarray of shape (X, Y, Z)
-        Integer-labelled subdivided parcellation (0 = background).
-    cortico_nuclear_map : np.ndarray of shape (X, Y, Z, 4)
-        Voxel-wise probabilities of projection to each of the four nuclei,
-        as produced by ``src.cortico_nuclear_map``.
-
-    Returns
-    -------
-    nuclear_probs : np.ndarray of shape (N_parcels, 4)
-        Row k is the mean nuclear-target probability vector for parcel k+1.
-        Rows are normalised to sum to 1.  Parcels with no cortical voxels
-        in the cortico-nuclear map get a uniform distribution.
-    """
-    parcel_labels = np.unique(parcellation_data)
-    parcel_labels = parcel_labels[parcel_labels > 0]
-    n_parcels = len(parcel_labels)
-
-    nuclear_probs = np.zeros((n_parcels, N_NUCLEI), dtype=np.float64)
-
-    for i, lbl in enumerate(parcel_labels):
-        mask = parcellation_data == lbl
-        voxel_probs = cortico_nuclear_map[mask]  # (N_voxels, 4)
-
-        if voxel_probs.shape[0] == 0 or voxel_probs.sum() == 0:
-            # No cortical overlap — assign uniform distribution
-            nuclear_probs[i] = 1.0 / N_NUCLEI
-            logger.warning(
-                "Parcel %d has no cortical overlap in cortico-nuclear map; "
-                "using uniform nuclear distribution.", lbl,
-            )
-            continue
-
-        mean_prob = voxel_probs.mean(axis=0)
-        total = mean_prob.sum()
-        if total > 0:
-            mean_prob /= total
-        else:
-            mean_prob[:] = 1.0 / N_NUCLEI
-
-        nuclear_probs[i] = mean_prob
-
-    logger.info(
-        "Computed nuclear probabilities for %d parcels.", n_parcels,
-    )
-    return nuclear_probs.astype(np.float32)
-
-
-# ---------------------------------------------------------------------------
-# Metadata sidecar
-# ---------------------------------------------------------------------------
-
-def save_parcellation_metadata(
-    parcel_info: list[dict],
-    nuclear_probs: np.ndarray,
-    output_path: str | Path,
-) -> None:
-    """
-    Save the JSON metadata sidecar describing the 4D pathway occupancy volume.
-
-    Parameters
-    ----------
-    parcel_info : list of dict
-        As returned by ``build_subdivided_parcellation``.
-    nuclear_probs : np.ndarray of shape (N_parcels, 4)
-        Nuclear target probability vectors for each parcel.
-    output_path : str or Path
-        Where to write the JSON file.
-    """
-    parcels_meta = []
-    for i, info in enumerate(parcel_info):
-        probs = nuclear_probs[i]
-        # Determine primary nucleus target
-        primary_idx = int(np.argmax(probs))
-        parcels_meta.append({
-            "index": info["index"],
-            "name": info["name"],
-            "lobule": info["lobule"],
-            "zone": info["zone"],
-            "hemisphere": info["hemisphere"],
-            "nucleus_target": NUCLEUS_NAMES[primary_idx],
-            "projection_prob": {
-                NUCLEUS_NAMES[j]: round(float(probs[j]), 4)
-                for j in range(N_NUCLEI)
-            },
-        })
-
-    metadata = {
-        "description": (
-            "4D pathway occupancy volume for the cerebellar efferent "
-            "disconnectome model. Each 3D sub-volume represents the "
-            "probability that a lesion at voxel (x,y,z) disrupts the "
-            "efferent output of the corresponding cortical parcel."
-        ),
-        "space": "SUIT",
-        "dimensions": {
-            "spatial": "X, Y, Z in SUIT template space",
-            "fourth": "N_parcels — one volume per subdivided cortical parcel",
-        },
-        "parcels": parcels_meta,
-        "assumptions_reference": "docs/assumptions.md",
-        "normative_data_source": (
-            "Elias et al. (2024) normative structural connectome, "
-            "HCP multi-shell diffusion MRI. "
-            "DOI: 10.1038/s41597-024-03197-0"
-        ),
-        "creation_date": datetime.now(timezone.utc).isoformat(),
-        "software_versions": {
-            "pipeline": "Cb_Disconnectome v0.1.0",
-            "nibabel": nib.__version__,
-            "numpy": np.__version__,
-        },
-    }
-
-    save_metadata(metadata, output_path)
-    logger.info("Saved parcellation metadata: %s", output_path)
-
-
-# ---------------------------------------------------------------------------
-# Efferent density loading helpers
+# Cortico-nuclear map loader
 # ---------------------------------------------------------------------------
 
 def _load_cortico_nuclear_map() -> tuple[np.ndarray, np.ndarray]:
@@ -445,73 +297,133 @@ def _load_cortico_nuclear_map() -> tuple[np.ndarray, np.ndarray]:
     return data, affine
 
 
+# ---------------------------------------------------------------------------
+# Efferent density map loading
+# ---------------------------------------------------------------------------
+
 def _load_efferent_density_maps() -> tuple[np.ndarray, np.ndarray]:
     """
-    Load the nuclear efferent density maps produced by Step 2.
+    Load efferent density maps from Step 2.
 
-    Expects a 4D NIfTI in data/interim/ with shape (X, Y, Z, 4) where the
-    4th dimension corresponds to the four nuclei (fastigial, emboliform,
-    globose, dentate) in the same order as NUCLEUS_NAMES.
+    Looks first for a combined 4D NIfTI, then falls back to loading and
+    stacking 4 individual per-nucleus files.
 
-    Returns (data, affine).
+    Returns (data, affine) where data has shape (X, Y, Z, 4).
     """
-    # Search for the efferent density maps
-    candidate_names = [
+    # Strategy 1: combined 4D file
+    for name in [
         "efferent_density_maps.nii.gz",
-        "nuclear_efferent_density.nii.gz",
         "efferent_density_4d.nii.gz",
-    ]
-    efferent_path = None
-    for name in candidate_names:
+        "nuclear_efferent_density.nii.gz",
+    ]:
         p = DATA_INTERIM / name
         if p.exists():
-            efferent_path = p
-            break
+            data, affine, _ = load_nifti(p, dtype=np.float32)
+            if data.ndim == 4 and data.shape[3] == N_NUCLEI:
+                logger.info("Loaded combined efferent maps: %s", p)
+                return data, affine
 
-    if efferent_path is None:
-        # Try glob as a fallback
-        candidates = list(DATA_INTERIM.glob("*efferent*density*.nii*"))
-        if candidates:
-            efferent_path = candidates[0]
+    # Strategy 2: individual per-nucleus files
+    individual = []
+    affine = None
+    for nucleus in NUCLEUS_NAMES:
+        candidates = sorted(DATA_INTERIM.glob(f"*efferent*density*{nucleus}*.nii*"))
+        if not candidates:
+            raise FileNotFoundError(
+                f"Efferent density map for '{nucleus}' not found in "
+                f"{DATA_INTERIM}. Run Step 2 first."
+            )
+        data_n, aff_n, _ = load_nifti(candidates[0], dtype=np.float32)
+        individual.append(data_n)
+        if affine is None:
+            affine = aff_n
+        logger.info("  Loaded %s: %s", nucleus, candidates[0].name)
 
-    if efferent_path is None:
-        raise FileNotFoundError(
-            "Nuclear efferent density maps not found in "
-            f"{DATA_INTERIM}. Run Step 2 (efferent pathway mapping) first."
-        )
-
-    data, affine, _ = load_nifti(efferent_path, dtype=np.float32)
-
-    if data.ndim != 4 or data.shape[3] != N_NUCLEI:
-        raise ValueError(
-            f"Expected efferent density maps with shape (X, Y, Z, {N_NUCLEI}), "
-            f"got {data.shape}."
-        )
-
-    logger.info(
-        "Loaded efferent density maps: %s  shape=%s", efferent_path, data.shape,
-    )
+    data = np.stack(individual, axis=-1)
+    logger.info("Stacked efferent maps: shape=%s", data.shape)
     return data, affine
 
 
 # ---------------------------------------------------------------------------
-# Main 4D build
+# Metadata sidecar
 # ---------------------------------------------------------------------------
 
-def build_pathway_occupancy_4d(
+def _build_parcel_label_name(label_int: int) -> str:
+    """Build a human-readable name for a SUIT lobular label."""
+    if label_int in DEFAULT_SUIT_LABELS:
+        lobule, side = DEFAULT_SUIT_LABELS[label_int]
+        prefix = {"L": "Left", "R": "Right", "V": "Vermis"}[side]
+        return f"{prefix}_{lobule}"
+    return f"label_{label_int}"
+
+
+def save_vertex_metadata(
+    n_vertices: int,
+    parcel_labels: np.ndarray,
+    output_path: str | Path,
+) -> None:
+    """Save the JSON metadata sidecar for vertex projection data."""
+    # Summarise per-parcel vertex counts
+    parcel_summary = []
+    for lbl_int, (lobule, side) in sorted(DEFAULT_SUIT_LABELS.items()):
+        count = int((parcel_labels == lbl_int).sum())
+        parcel_summary.append({
+            "label": lbl_int,
+            "name": _build_parcel_label_name(lbl_int),
+            "lobule": lobule,
+            "hemisphere": side,
+            "n_vertices": count,
+        })
+
+    metadata = {
+        "description": (
+            "Per-vertex nuclear projection data for the cerebellar "
+            "disconnectome model.  Each surface vertex has a 4-element "
+            "probability vector indicating its projection strength to "
+            "each deep cerebellar nucleus."
+        ),
+        "space": "SUIT",
+        "n_vertices": n_vertices,
+        "n_nuclei": N_NUCLEI,
+        "nucleus_order": NUCLEUS_NAMES,
+        "depth_sampling": list(DEFAULT_DEPTHS),
+        "parcels": parcel_summary,
+        "normative_data_source": (
+            "Elias et al. (2024) normative structural connectome, "
+            "HCP multi-shell diffusion MRI. "
+            "DOI: 10.1038/s41597-024-03197-0"
+        ),
+        "assumptions_reference": "docs/assumptions.md",
+        "creation_date": datetime.now(timezone.utc).isoformat(),
+        "software_versions": {
+            "pipeline": "Cb_Disconnectome v0.2.0",
+            "nibabel": nib.__version__,
+            "numpy": np.__version__,
+        },
+    }
+
+    save_metadata(metadata, output_path)
+    logger.info("Saved vertex metadata: %s", output_path)
+
+
+# ---------------------------------------------------------------------------
+# Main build
+# ---------------------------------------------------------------------------
+
+def build_vertex_projections(
     config: dict | None = None,
 ) -> Path:
     """
-    Build and save the full 4D pathway occupancy volume.
+    Build and save per-vertex nuclear projection data.
 
-    This is the main integration function.  For each cortical parcel k it:
-      1. Looks up which nuclei parcel k projects to (from the cortico-nuclear
-         map computed in Step 1).
-      2. Weights the nuclear efferent density maps (from Step 2) by parcel k's
-         projection probabilities.
-      3. Adds the cortical voxels of parcel k as a "direct injury" zone
-         (probability = 1.0).
-      4. Stores the resulting 3D map as volume k of the 4D output.
+    For each of the 28,935 SUIT surface vertices:
+      1. Samples the cortico-nuclear probability map (Step 1) at multiple
+         depths between pial and white surfaces.
+      2. Averages across depths to get a (4,) nuclear projection vector.
+      3. Determines the SUIT lobular label at the vertex location.
+
+    Also combines the per-nucleus efferent density maps (Step 2) into a
+    single 4D NIfTI for use at inference time.
 
     Parameters
     ----------
@@ -520,21 +432,18 @@ def build_pathway_occupancy_4d(
 
     Returns
     -------
-    Path to the saved 4D NIfTI.
+    Path to the saved vertex_projections.npz file.
     """
     cfg = get_config(config)
 
     # ------------------------------------------------------------------
-    # Step A: Build (or load) the subdivided parcellation
+    # Step A: Load SUIT surfaces
     # ------------------------------------------------------------------
     logger.info("=" * 60)
-    logger.info("Step A: Building subdivided parcellation")
+    logger.info("Step A: Loading SUIT surface meshes")
     logger.info("=" * 60)
-    parcellation_data, parcel_info = build_subdivided_parcellation(cfg)
-
-    n_parcels = len(parcel_info)
-    if n_parcels == 0:
-        raise RuntimeError("No parcels were created.  Check atlas data.")
+    pial_coords, white_coords = load_suit_surfaces(space="SUIT")
+    n_vertices = pial_coords.shape[0]
 
     # ------------------------------------------------------------------
     # Step B: Load the cortico-nuclear probability map (Step 1 output)
@@ -545,75 +454,77 @@ def build_pathway_occupancy_4d(
     cn_map, cn_affine = _load_cortico_nuclear_map()
 
     # ------------------------------------------------------------------
-    # Step C: Compute per-parcel nuclear projection probabilities
+    # Step C: Sample cortico-nuclear map at each vertex
     # ------------------------------------------------------------------
     logger.info("=" * 60)
-    logger.info("Step C: Computing per-parcel nuclear probabilities")
+    logger.info("Step C: Sampling cortico-nuclear map at %d vertices", n_vertices)
     logger.info("=" * 60)
-    nuclear_probs = compute_parcel_nuclear_probs(parcellation_data, cn_map)
-    # nuclear_probs shape: (n_parcels, 4)
+    projections = sample_volume_at_vertices(
+        cn_map, cn_affine, pial_coords, white_coords, DEFAULT_DEPTHS,
+    )
+    # projections shape: (n_vertices, 4)
+
+    # Normalise each vertex's projection vector to sum to 1
+    row_sums = projections.sum(axis=1, keepdims=True)
+    row_sums = np.where(row_sums > 0, row_sums, 1.0)
+    projections = (projections / row_sums).astype(np.float32)
+
+    n_nonzero = int((projections.sum(axis=1) > 0).sum())
+    logger.info(
+        "  Vertices with nonzero projections: %d / %d (%.1f%%)",
+        n_nonzero, n_vertices, 100.0 * n_nonzero / n_vertices,
+    )
 
     # ------------------------------------------------------------------
-    # Step D: Load nuclear efferent density maps (Step 2 output)
+    # Step D: Determine per-vertex lobular labels
     # ------------------------------------------------------------------
     logger.info("=" * 60)
-    logger.info("Step D: Loading efferent density maps")
+    logger.info("Step D: Assigning lobular labels to vertices")
+    logger.info("=" * 60)
+    parc_data, parc_affine, _ = _load_suit_parcellation(cfg)
+    parc_data[parc_data > N_CORTICAL_PARCELS] = 0  # zero out nuclei
+
+    # Sample parcellation at vertices using mode-like approach
+    # (use depth=0.5, the midpoint of cortical thickness)
+    mid_coords = 0.5 * pial_coords + 0.5 * white_coords
+    inv_affine = np.linalg.inv(parc_affine)
+    ones = np.ones((n_vertices, 1), dtype=np.float64)
+    homogeneous = np.hstack([mid_coords, ones])
+    voxel_float = (inv_affine @ homogeneous.T).T[:, :3]
+    voxel_idx = np.round(voxel_float).astype(int)
+
+    spatial_shape = np.array(parc_data.shape[:3])
+    in_bounds = (
+        np.all(voxel_idx >= 0, axis=1)
+        & (voxel_idx[:, 0] < spatial_shape[0])
+        & (voxel_idx[:, 1] < spatial_shape[1])
+        & (voxel_idx[:, 2] < spatial_shape[2])
+    )
+
+    parcel_labels = np.zeros(n_vertices, dtype=np.int32)
+    valid_vox = voxel_idx[in_bounds]
+    parcel_labels[in_bounds] = parc_data[
+        valid_vox[:, 0], valid_vox[:, 1], valid_vox[:, 2]
+    ]
+
+    for lbl_int in sorted(DEFAULT_SUIT_LABELS.keys()):
+        count = int((parcel_labels == lbl_int).sum())
+        logger.info(
+            "  %-20s  %d vertices",
+            _build_parcel_label_name(lbl_int), count,
+        )
+
+    # ------------------------------------------------------------------
+    # Step E: Load and combine efferent density maps
+    # ------------------------------------------------------------------
+    logger.info("=" * 60)
+    logger.info("Step E: Loading and combining efferent density maps")
     logger.info("=" * 60)
     efferent_maps, eff_affine = _load_efferent_density_maps()
 
-    # Verify spatial alignment between parcellation and efferent maps
-    spatial_shape = parcellation_data.shape[:3]
-    if efferent_maps.shape[:3] != spatial_shape:
-        raise ValueError(
-            f"Spatial shape mismatch: parcellation {spatial_shape} vs "
-            f"efferent maps {efferent_maps.shape[:3]}. Both must be in "
-            "SUIT space with identical resolution."
-        )
-
-    # ------------------------------------------------------------------
-    # Step E: Build the 4D pathway occupancy volume
-    # ------------------------------------------------------------------
-    logger.info("=" * 60)
-    logger.info("Step E: Building 4D pathway occupancy volume (%d parcels)", n_parcels)
-    logger.info("=" * 60)
-
-    density_threshold = cfg.get("EFFERENT_DENSITY_THRESHOLD", 0.01)
-    occupancy_4d = np.zeros((*spatial_shape, n_parcels), dtype=np.float32)
-
-    for i, info in enumerate(parcel_info):
-        parcel_label = info["index"]
-        parcel_name = info["name"]
-        parcel_mask = parcellation_data == parcel_label
-
-        logger.info(
-            "  Parcel %3d / %d: %-28s  (%d cortical voxels)",
-            i + 1, n_parcels, parcel_name, int(parcel_mask.sum()),
-        )
-
-        # --- Efferent pathway contribution ---
-        # Weight each nucleus's efferent density map by the parcel's
-        # projection probability to that nucleus, then sum across nuclei.
-        prob_vec = nuclear_probs[i]  # shape (4,)
-
-        # Efficient weighted sum: efferent_maps is (X, Y, Z, 4), prob_vec is (4,)
-        # Result is (X, Y, Z) — the combined efferent density for this parcel.
-        weighted_efferent = np.einsum("...n,n->...", efferent_maps, prob_vec)
-
-        # --- Direct injury zone ---
-        # Cortical voxels belonging to this parcel are always disrupted by
-        # a lesion at that location (probability = 1.0).
-        weighted_efferent[parcel_mask] = 1.0
-
-        # --- Threshold very low values to zero for sparsity / file size ---
-        weighted_efferent[weighted_efferent < density_threshold] = 0.0
-
-        # --- Clip to [0, 1] ---
-        np.clip(weighted_efferent, 0.0, 1.0, out=weighted_efferent)
-
-        occupancy_4d[..., i] = weighted_efferent
-
-    # Final type enforcement
-    occupancy_4d = occupancy_4d.astype(np.float32)
+    # Save combined 4D efferent maps in data/final/ for inference
+    efferent_4d_path = DATA_FINAL / "efferent_density_suit_4d.nii.gz"
+    save_nifti(efferent_maps, eff_affine, efferent_4d_path)
 
     # ------------------------------------------------------------------
     # Step F: Save outputs
@@ -622,28 +533,30 @@ def build_pathway_occupancy_4d(
     logger.info("Step F: Saving outputs")
     logger.info("=" * 60)
 
-    # 4D volume
-    out_4d_path = DATA_FINAL / "pathway_occupancy_4d.nii.gz"
-    save_nifti(occupancy_4d, eff_affine, out_4d_path)
-    logger.info(
-        "Saved 4D pathway occupancy: %s  shape=%s  dtype=%s",
-        out_4d_path, occupancy_4d.shape, occupancy_4d.dtype,
+    DATA_FINAL.mkdir(parents=True, exist_ok=True)
+
+    # Vertex projections .npz
+    npz_path = DATA_FINAL / "vertex_projections.npz"
+    np.savez_compressed(
+        npz_path,
+        projections=projections,
+        pial_coords=pial_coords.astype(np.float32),
+        white_coords=white_coords.astype(np.float32),
+        parcel_labels=parcel_labels,
     )
+    logger.info("Saved vertex projections: %s", npz_path)
+    logger.info("  projections:   (%d, %d)", *projections.shape)
+    logger.info("  pial_coords:   (%d, %d)", *pial_coords.shape)
+    logger.info("  white_coords:  (%d, %d)", *white_coords.shape)
+    logger.info("  parcel_labels: (%d,)", parcel_labels.shape[0])
 
     # Metadata sidecar
-    meta_path = DATA_FINAL / "pathway_occupancy_metadata.json"
-    save_parcellation_metadata(parcel_info, nuclear_probs, meta_path)
+    meta_path = DATA_FINAL / "vertex_metadata.json"
+    save_vertex_metadata(n_vertices, parcel_labels, meta_path)
 
-    # Summary statistics
-    nonzero_fraction = (occupancy_4d > 0).mean()
-    logger.info("4D volume sparsity: %.1f%% nonzero", nonzero_fraction * 100)
-    logger.info(
-        "Value range: [%.4f, %.4f]",
-        float(occupancy_4d.min()), float(occupancy_4d.max()),
-    )
+    logger.info("=" * 60)
     logger.info("Build complete.")
-
-    return out_4d_path
+    return npz_path
 
 
 # ---------------------------------------------------------------------------
@@ -652,9 +565,7 @@ def build_pathway_occupancy_4d(
 
 def main():
     parser = argparse.ArgumentParser(
-        description=(
-            "Build the 4D pathway occupancy volume (Step 3 — core integration)"
-        ),
+        description="Build vertex-level nuclear projections (Step 3)"
     )
     parser.add_argument(
         "--config", type=str, default=None,
@@ -667,7 +578,7 @@ def main():
         with open(args.config) as f:
             config = json.load(f)
 
-    build_pathway_occupancy_4d(config=config)
+    build_vertex_projections(config=config)
 
 
 if __name__ == "__main__":

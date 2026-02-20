@@ -10,7 +10,7 @@ The cerebellar efferent pathway flows:
 
 A lesion anywhere along this pathway disconnects the upstream cortical regions whose output funnels through the damaged segment. This convergence is especially pronounced at the SCP, where output from broad cortical territories narrows into a compact fiber bundle. A small SCP lesion can therefore produce widespread cortical disconnection — a pattern not captured by traditional lesion-symptom mapping that only considers direct cortical damage.
 
-This tool produces a **4D NIfTI "pathway occupancy volume"** where each 3D volume represents the spatial probability that efferent streamlines from one cerebellar cortical parcel pass through each white matter voxel. At inference time, intersecting a lesion mask with this 4D volume produces a cortical disruption map that can be projected onto the SUIT cerebellar flatmap.
+This tool produces **vertex-level cortical disruption maps** at the resolution of the SUIT cerebellar surface mesh (28,935 vertices). At inference time, a lesion mask is combined with per-vertex nuclear projection probabilities and efferent density maps via an on-the-fly matrix multiplication, producing a disruption score for each surface vertex that maps directly onto the SUIT flatmap.
 
 ## Installation
 
@@ -62,28 +62,19 @@ python -m src.inference path/to/lesion_SUIT.nii.gz [output_directory]
 ### Python API
 
 ```python
-from src.inference import infer_disruption, disruption_to_volume
+from src.inference import infer_disruption
 from src.flatmap import plot_disruption_flatmap
 
-# Compute disruption probabilities
+# Compute vertex-level disruption probabilities (28,935 values)
 disruption = infer_disruption(
     'my_lesion_SUIT.nii.gz',
-    'data/final/pathway_occupancy_4d.nii.gz',
     method='max'
 )
 
-# Convert to volume for visualization
-vol = disruption_to_volume(
-    disruption,
-    'data/final/parcellation_subdivided_SUIT.nii.gz',
-    'data/final/pathway_occupancy_4d.nii.gz'
-)
-vol.to_filename('my_disruption_map.nii.gz')
-
-# Render on SUIT flatmap
+# Render directly on SUIT flatmap (no volume projection needed)
 plot_disruption_flatmap(
-    'my_disruption_map.nii.gz',
-    lesion_volume_path='my_lesion_SUIT.nii.gz',
+    disruption,
+    lesion_data='my_lesion_SUIT.nii.gz',
     output_path='my_disruption_flatmap.png'
 )
 ```
@@ -97,9 +88,9 @@ The model is built in 5 steps:
 | 0 | `src/download.py` | Download atlas and connectome data |
 | 1 | `src/cortico_nuclear_map.py` | Map cerebellar cortex voxels to deep nuclei targets |
 | 2 | `src/tractography.py` | Build efferent pathway density maps from normative tractography |
-| 3 | `src/build_4d_nifti.py` | Assemble the 4D pathway occupancy volume |
-| 4 | `src/inference.py` | Lesion mask → cortical disruption probabilities |
-| 5 | `src/flatmap.py` | Project results onto SUIT cerebellar flatmap |
+| 3 | `src/build_4d_nifti.py` | Compute per-vertex nuclear projections using SUIT surfaces |
+| 4 | `src/inference.py` | Lesion mask → vertex-wise cortical disruption probabilities |
+| 5 | `src/flatmap.py` | Render results on SUIT cerebellar flatmap |
 
 ### Build the full pipeline
 
@@ -113,30 +104,34 @@ python -m src.cortico_nuclear_map
 # Step 2: Build efferent pathway density maps
 python -m src.tractography
 
-# Step 3: Assemble 4D pathway occupancy volume
+# Step 3: Compute per-vertex nuclear projections
 python -m src.build_4d_nifti
-
-# Run QA checks
-python qa/qa_01_atlas_alignment.py
-python qa/qa_02_cortico_nuclear.py
-python qa/qa_03_tractography.py
-python qa/qa_04_4d_nifti.py
-python qa/qa_05_inference_sanity.py
-python qa/qa_06_flatmap_projection.py
 ```
 
-## The 4D Pathway Occupancy Volume
+## Vertex-Level Architecture
 
-The primary output is `data/final/pathway_occupancy_4d.nii.gz`:
+The core data products are:
 
-- **Space:** SUIT cerebellar space
-- **Shape:** `(X, Y, Z, N_parcels)` where N_parcels ≈ 60–80
-- **Values:** Probability [0, 1] that a lesion at each voxel disrupts each cortical parcel
-  - `1.0` = direct cortical injury (the voxel is within the parcel)
-  - `0 < p < 1` = downstream disconnection via efferent pathways
-  - `0.0` = no relationship
+### Step 3 outputs (in `data/final/`)
 
-Parcel definitions and metadata are in `data/final/pathway_occupancy_metadata.json`.
+- **`vertex_projections.npz`** — per-vertex nuclear projection data:
+  - `projections` (28935, 4): probability that each vertex projects to each nucleus
+  - `pial_coords` (28935, 3): pial surface coordinates in SUIT mm
+  - `white_coords` (28935, 3): white-matter surface coordinates in SUIT mm
+  - `parcel_labels` (28935,): SUIT lobular label per vertex (1-28)
+- **`efferent_density_suit_4d.nii.gz`** — combined efferent density maps (X, Y, Z, 4)
+- **`vertex_metadata.json`** — JSON metadata sidecar
+
+### Inference (on-the-fly)
+
+For a lesion mask with N voxels:
+
+1. Extract efferent density at lesion voxels → `E` of shape `(N_lesion, 4)`
+2. Matrix multiply: `E @ P.T` → `(N_lesion, 28935)` per-voxel per-vertex scores
+3. Aggregate across lesion voxels (max/mean/etc.) → `(28935,)` disruption scores
+4. Direct injury: vertices whose cortical locations overlap the lesion → set to 1.0
+
+The output maps directly onto the SUIT flatmap by vertex index — no volume-to-surface projection is needed.
 
 ## Inference Methods
 
@@ -144,10 +139,10 @@ Four aggregation methods are available:
 
 | Method | Formula | Interpretation |
 |--------|---------|----------------|
-| `max` | max occupancy across lesion voxels | "Weakest link" — single-voxel transection suffices |
-| `mean` | average occupancy across lesion voxels | Smoothed estimate; underestimates focal lesions |
-| `weighted_sum` | normalized sum of occupancy | Correlates with lesion size |
-| `threshold_fraction` | fraction of pathway volume intersected | Most biologically interpretable |
+| `max` (default) | max weighted density across lesion voxels | "Weakest link" — single-voxel transection suffices |
+| `mean` | average weighted density across lesion voxels | Smoothed estimate weighted by spatial extent |
+| `weighted_sum` | normalized sum of weighted densities | Correlates with lesion size |
+| `threshold_fraction` | per-nucleus pathway fraction, combined by projection | Most biologically interpretable |
 
 The default is `max`, following the principle that a single point of complete fiber transection is sufficient to disconnect all streamlines passing through it.
 
@@ -162,10 +157,6 @@ This model relies on several anatomical assumptions documented in [docs/assumpti
 
 These assumptions and their limitations are discussed in detail in the assumptions document.
 
-## Quality Assurance
-
-Six QA scripts validate each pipeline stage. Reports are saved to `docs/qa_reports/`. See the [QA checklist](#global-quality-assurance-checklist) for expected results.
-
 ## Project Structure
 
 ```
@@ -173,7 +164,7 @@ Six QA scripts validate each pipeline stage. Reports are saved to `docs/qa_repor
 │   ├── download.py         # Data acquisition
 │   ├── cortico_nuclear_map.py  # Cortex-to-nuclei mapping
 │   ├── tractography.py     # Efferent pathway modeling
-│   ├── build_4d_nifti.py   # 4D volume assembly
+│   ├── build_4d_nifti.py   # Vertex projection assembly
 │   ├── inference.py        # Lesion inference engine
 │   ├── flatmap.py          # SUIT flatmap visualization
 │   └── utils.py            # Shared utilities

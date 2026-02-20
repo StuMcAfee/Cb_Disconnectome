@@ -1,17 +1,32 @@
 """
 Lesion inference engine for the cerebellar disconnectome model.
 
-Takes a binary lesion mask in SUIT space and produces cortical disruption
-probabilities by querying a precomputed 4D pathway occupancy volume.
+Takes a binary lesion mask in SUIT space and produces **vertex-wise** cortical
+disruption probabilities (one per SUIT surface vertex, 28,935 total) by
+combining precomputed per-vertex nuclear projections with efferent pathway
+density maps.
 
 Input:  Binary lesion mask in SUIT space (NIfTI, 3D)
-Output: 1D array of disruption probabilities, one per cortical parcel
+Output: 1D array of disruption probabilities, one per surface vertex (28,935)
+
+Architecture
+------------
+Precomputed data (from build_4d_nifti / Step 3):
+  - vertex_projections.npz: per-vertex nuclear projection probabilities
+    (N_vertices, 4) plus pial/white surface coordinates
+  - efferent_density_suit_4d.nii.gz: combined efferent density maps (X,Y,Z,4)
+
+At inference time, for a lesion with N voxels:
+  1. Extract efferent density at lesion voxels -> E (N_lesion, 4)
+  2. Compute per-voxel per-vertex scores -> E @ P.T (N_lesion, N_vertices)
+  3. Aggregate across lesion voxels (max/mean/etc.) -> (N_vertices,)
+  4. Direct injury: if lesion overlaps a vertex's cortical location, set to 1.0
 
 Aggregation methods:
-  - max:                maximum pathway occupancy across lesion voxels
-  - mean:              average pathway occupancy across lesion voxels
-  - weighted_sum:      sum of occupancy values, normalized to [0, 1]
-  - threshold_fraction: fraction of pathway volume intersected (threshold > 0.1)
+  - max (default):     maximum weighted pathway density across lesion voxels
+  - mean:              average weighted pathway density across lesion voxels
+  - weighted_sum:      sum of densities, normalized to [0, 1]
+  - threshold_fraction: per-nucleus pathway fraction, combined by projection
 
 Usage:
     python -m src.inference <lesion_SUIT.nii.gz> [output_dir]
@@ -20,13 +35,11 @@ Usage:
 import logging
 from pathlib import Path
 
-import nibabel as nib
 import numpy as np
 import pandas as pd
 
 from src.utils import (
     load_nifti,
-    save_nifti,
     load_metadata,
     check_affine_match,
     check_shape_match,
@@ -40,16 +53,103 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 # Default file paths within data/final/
 # ---------------------------------------------------------------------------
 
-DEFAULT_OCCUPANCY_PATH = DATA_FINAL / "pathway_occupancy_4d.nii.gz"
-DEFAULT_PARCELLATION_PATH = DATA_FINAL / "cortical_parcellation_SUIT.nii.gz"
-DEFAULT_REFERENCE_PATH = DATA_FINAL / "SUIT_reference.nii.gz"
-DEFAULT_METADATA_PATH = DATA_FINAL / "parcel_metadata.json"
+DEFAULT_EFFERENT_PATH = DATA_FINAL / "efferent_density_suit_4d.nii.gz"
+DEFAULT_PROJECTIONS_PATH = DATA_FINAL / "vertex_projections.npz"
+DEFAULT_METADATA_PATH = DATA_FINAL / "vertex_metadata.json"
 
-# Occupancy threshold for the 'threshold_fraction' method
+# Threshold for the 'threshold_fraction' method
 _THRESHOLD_FRACTION_CUTOFF = 0.1
 
 # Available aggregation methods
 VALID_METHODS = ("max", "mean", "weighted_sum", "threshold_fraction")
+
+# Depth fractions for direct injury checking (pial=0 to white=1)
+_DIRECT_INJURY_DEPTHS = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+
+N_NUCLEI = 4
+
+
+# ---------------------------------------------------------------------------
+# Vertex projection loader
+# ---------------------------------------------------------------------------
+
+def load_vertex_projections(
+    projections_path: str | Path = DEFAULT_PROJECTIONS_PATH,
+) -> dict[str, np.ndarray]:
+    """
+    Load precomputed vertex projection data.
+
+    Returns a dict with keys: 'projections', 'pial_coords', 'white_coords',
+    'parcel_labels'.
+    """
+    projections_path = Path(projections_path)
+    if not projections_path.exists():
+        raise FileNotFoundError(
+            f"Vertex projections not found: {projections_path}. "
+            "Run 'python -m src.build_4d_nifti' first (Step 3)."
+        )
+    npz = np.load(projections_path)
+    return {
+        "projections": npz["projections"],
+        "pial_coords": npz["pial_coords"],
+        "white_coords": npz["white_coords"],
+        "parcel_labels": npz["parcel_labels"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Direct injury detection
+# ---------------------------------------------------------------------------
+
+def _detect_direct_injury(
+    lesion_data: np.ndarray,
+    lesion_affine: np.ndarray,
+    pial_coords: np.ndarray,
+    white_coords: np.ndarray,
+) -> np.ndarray:
+    """
+    Identify vertices whose cortical locations overlap the lesion.
+
+    For each vertex, samples at multiple depths between the pial and white
+    surfaces.  If any depth sample falls inside a lesion voxel, the vertex
+    is marked as directly injured.
+
+    Returns a boolean array of shape (N_vertices,).
+    """
+    n_vertices = pial_coords.shape[0]
+    spatial_shape = np.array(lesion_data.shape[:3])
+    inv_affine = np.linalg.inv(lesion_affine)
+
+    injured = np.zeros(n_vertices, dtype=bool)
+
+    for depth in _DIRECT_INJURY_DEPTHS:
+        coords_mm = (1.0 - depth) * pial_coords + depth * white_coords
+
+        ones = np.ones((n_vertices, 1), dtype=np.float64)
+        homogeneous = np.hstack([coords_mm, ones])
+        voxel_float = (inv_affine @ homogeneous.T).T[:, :3]
+        voxel_idx = np.round(voxel_float).astype(int)
+
+        in_bounds = (
+            np.all(voxel_idx >= 0, axis=1)
+            & (voxel_idx[:, 0] < spatial_shape[0])
+            & (voxel_idx[:, 1] < spatial_shape[1])
+            & (voxel_idx[:, 2] < spatial_shape[2])
+        )
+
+        if not in_bounds.any():
+            continue
+
+        valid_voxels = voxel_idx[in_bounds]
+        hits = lesion_data[
+            valid_voxels[:, 0], valid_voxels[:, 1], valid_voxels[:, 2]
+        ] > 0
+
+        # Map hits back to the full vertex array
+        in_bounds_indices = np.where(in_bounds)[0]
+        injured[in_bounds_indices[hits]] = True
+
+    return injured
 
 
 # ---------------------------------------------------------------------------
@@ -58,36 +158,30 @@ VALID_METHODS = ("max", "mean", "weighted_sum", "threshold_fraction")
 
 def infer_disruption(
     lesion_path: str | Path,
-    occupancy_path: str | Path,
+    efferent_path: str | Path = DEFAULT_EFFERENT_PATH,
+    projections_path: str | Path = DEFAULT_PROJECTIONS_PATH,
     method: str = "max",
 ) -> np.ndarray:
     """
-    Compute parcel-wise cortical disruption from a cerebellar lesion mask.
+    Compute vertex-wise cortical disruption from a cerebellar lesion mask.
 
     Parameters
     ----------
     lesion_path : str or Path
         Path to a binary lesion mask NIfTI in SUIT space (3D).
-    occupancy_path : str or Path
-        Path to a 4D pathway occupancy volume in SUIT space.
-        Shape is (X, Y, Z, N_parcels) where the 4th dimension indexes
-        cortical parcels and each voxel holds the probability that a
-        streamline passing through it connects to that parcel.
+    efferent_path : str or Path
+        Path to the 4D efferent density maps (X, Y, Z, 4).
+    projections_path : str or Path
+        Path to vertex_projections.npz with per-vertex nuclear projection
+        probabilities and surface coordinates.
     method : str
-        Aggregation method, one of 'max', 'mean', 'weighted_sum',
-        or 'threshold_fraction'.
+        Aggregation method: 'max', 'mean', 'weighted_sum', or
+        'threshold_fraction'.
 
     Returns
     -------
-    disruption : np.ndarray of shape (N_parcels,)
-        Disruption probability for each cortical parcel.
-
-    Raises
-    ------
-    ValueError
-        If method is not recognized, or if spatial alignment fails.
-    FileNotFoundError
-        If either input file is missing.
+    disruption : np.ndarray of shape (N_vertices,)
+        Disruption probability for each surface vertex.
     """
     if method not in VALID_METHODS:
         raise ValueError(
@@ -99,30 +193,30 @@ def infer_disruption(
     logger.info("Loading lesion mask: %s", lesion_path)
     lesion_data, lesion_affine, _ = load_nifti(lesion_path, dtype=np.float32)
 
-    logger.info("Loading pathway occupancy: %s", occupancy_path)
-    occ_data, occ_affine, _ = load_nifti(occupancy_path, dtype=np.float32)
+    logger.info("Loading efferent density maps: %s", efferent_path)
+    eff_data, eff_affine, _ = load_nifti(efferent_path, dtype=np.float32)
+
+    logger.info("Loading vertex projections: %s", projections_path)
+    vp = load_vertex_projections(projections_path)
+    proj = vp["projections"]            # (N_vertices, 4)
+    pial_coords = vp["pial_coords"]     # (N_vertices, 3)
+    white_coords = vp["white_coords"]   # (N_vertices, 3)
+
+    n_vertices = proj.shape[0]
 
     # --- Verify spatial alignment ---
-    if not check_affine_match(lesion_affine, occ_affine):
+    if not check_affine_match(lesion_affine, eff_affine):
         raise ValueError(
-            "Affine mismatch between lesion mask and occupancy volume. "
-            "Both must be in the same SUIT space. "
-            f"Lesion affine:\n{lesion_affine}\n"
-            f"Occupancy affine:\n{occ_affine}"
+            "Affine mismatch between lesion mask and efferent density maps. "
+            "Both must be in the same SUIT space."
         )
 
-    if not check_shape_match(lesion_data.shape, occ_data.shape):
+    if not check_shape_match(lesion_data.shape, eff_data.shape):
         raise ValueError(
-            "Shape mismatch between lesion mask and occupancy volume. "
+            "Shape mismatch between lesion mask and efferent density maps. "
             f"Lesion shape: {lesion_data.shape[:3]}, "
-            f"Occupancy shape: {occ_data.shape[:3]}"
+            f"Efferent shape: {eff_data.shape[:3]}"
         )
-
-    n_parcels = occ_data.shape[3]
-    logger.info(
-        "Occupancy volume has %d parcels, spatial shape %s",
-        n_parcels, occ_data.shape[:3],
-    )
 
     # --- Identify lesion voxels ---
     lesion_mask = lesion_data > 0
@@ -131,20 +225,26 @@ def infer_disruption(
 
     if n_lesion_voxels == 0:
         logger.warning("Lesion mask is empty; returning zero disruption.")
-        return np.zeros(n_parcels, dtype=np.float32)
+        return np.zeros(n_vertices, dtype=np.float32)
 
-    # Extract occupancy at lesion voxels: shape (N_lesion_voxels, N_parcels)
-    occ_at_lesion = occ_data[lesion_mask]
+    # --- Extract efferent density at lesion voxels ---
+    # E shape: (N_lesion, 4)
+    E_lesion = eff_data[lesion_mask]
 
     # --- Aggregate ---
     if method == "max":
-        disruption = occ_at_lesion.max(axis=0)
+        # (N_lesion, 4) @ (4, N_vertices) -> (N_lesion, N_vertices)
+        # then max across lesion voxels
+        scores = E_lesion @ proj.T
+        disruption = scores.max(axis=0)
 
     elif method == "mean":
-        disruption = occ_at_lesion.mean(axis=0)
+        scores = E_lesion @ proj.T
+        disruption = scores.mean(axis=0)
 
     elif method == "weighted_sum":
-        raw_sum = occ_at_lesion.sum(axis=0)
+        scores = E_lesion @ proj.T
+        raw_sum = scores.sum(axis=0)
         max_val = raw_sum.max()
         if max_val > 0:
             disruption = raw_sum / max_val
@@ -152,138 +252,100 @@ def infer_disruption(
             disruption = raw_sum
 
     elif method == "threshold_fraction":
-        # For each parcel, find the total number of voxels in the full
-        # volume where occupancy exceeds the threshold (the pathway volume).
-        # Then count how many of those voxels fall inside the lesion.
-        above_threshold = occ_data > _THRESHOLD_FRACTION_CUTOFF
-        pathway_volume = above_threshold.sum(axis=(0, 1, 2)).astype(np.float64)
-        lesion_intersect = above_threshold[lesion_mask].sum(axis=0).astype(np.float64)
-        # Avoid division by zero for parcels with no supra-threshold voxels
-        disruption = np.where(
-            pathway_volume > 0,
-            lesion_intersect / pathway_volume,
-            0.0,
-        ).astype(np.float32)
+        # Per-nucleus: fraction of pathway volume intersected by the lesion
+        fractions = np.zeros(N_NUCLEI, dtype=np.float64)
+        for n in range(N_NUCLEI):
+            above = eff_data[..., n] > _THRESHOLD_FRACTION_CUTOFF
+            pathway_vol = float(above.sum())
+            lesion_intersect = float(above[lesion_mask].sum())
+            fractions[n] = lesion_intersect / max(pathway_vol, 1.0)
+        # Combine per-nucleus fractions using vertex projection weights
+        disruption = (proj @ fractions).astype(np.float32)
+
+    # --- Direct injury ---
+    injured = _detect_direct_injury(
+        lesion_data, lesion_affine, pial_coords, white_coords,
+    )
+    n_injured = int(injured.sum())
+    if n_injured > 0:
+        logger.info("Direct cortical injury: %d vertices", n_injured)
+        disruption[injured] = 1.0
+
+    disruption = np.clip(disruption, 0.0, 1.0).astype(np.float32)
 
     logger.info(
-        "Disruption (%s): min=%.4f, max=%.4f, mean=%.4f",
+        "Disruption (%s): min=%.4f, max=%.4f, mean=%.4f, "
+        "nonzero=%d / %d vertices",
         method, disruption.min(), disruption.max(), disruption.mean(),
+        int((disruption > 0).sum()), n_vertices,
     )
 
-    return disruption.astype(np.float32)
+    return disruption
 
 
 # ---------------------------------------------------------------------------
-# Volume reconstruction
-# ---------------------------------------------------------------------------
-
-def disruption_to_volume(
-    disruption: np.ndarray,
-    parcellation_path: str | Path,
-    reference_path: str | Path,
-) -> nib.Nifti1Image:
-    """
-    Convert a parcel-wise disruption vector to a 3D NIfTI volume.
-
-    Each cortical voxel is assigned the disruption value of its parcel.
-    Non-cortical voxels remain zero.
-
-    Parameters
-    ----------
-    disruption : np.ndarray of shape (N_parcels,)
-        Disruption probability per parcel (e.g., output of infer_disruption).
-    parcellation_path : str or Path
-        Path to a 3D integer parcellation NIfTI in SUIT space.
-        Voxel values are 1-based parcel indices; 0 = background.
-    reference_path : str or Path
-        Path to a reference NIfTI for the output affine and header.
-
-    Returns
-    -------
-    nib.Nifti1Image
-        3D volume with disruption values painted onto parcels.
-    """
-    logger.info("Loading parcellation: %s", parcellation_path)
-    parc_data, parc_affine, _ = load_nifti(parcellation_path, dtype=int)
-
-    logger.info("Loading reference: %s", reference_path)
-    _, ref_affine, ref_header = load_nifti(reference_path)
-
-    n_parcels = len(disruption)
-
-    # Build lookup table: index 0 = background (0.0), indices 1..N = disruption
-    lut = np.zeros(n_parcels + 1, dtype=np.float32)
-    lut[1:] = disruption
-
-    # Clip parcel indices to valid range
-    safe_parc = np.clip(parc_data, 0, n_parcels)
-    vol = lut[safe_parc]
-
-    logger.info(
-        "Disruption volume: shape=%s, nonzero voxels=%d",
-        vol.shape, int((vol > 0).sum()),
-    )
-
-    return nib.Nifti1Image(vol, ref_affine, ref_header)
-
-
-# ---------------------------------------------------------------------------
-# Summary table
+# Summary table (aggregated by lobule)
 # ---------------------------------------------------------------------------
 
 def summarize_disruption(
     disruption: np.ndarray,
-    metadata_path: str | Path,
+    metadata_path: str | Path = DEFAULT_METADATA_PATH,
+    projections_path: str | Path = DEFAULT_PROJECTIONS_PATH,
 ) -> pd.DataFrame:
     """
-    Pair disruption values with parcel metadata and return a sorted DataFrame.
+    Aggregate vertex-level disruption by lobule and return a sorted DataFrame.
+
+    For each of the 28 SUIT lobular parcels, computes the mean disruption
+    across its vertices.
 
     Parameters
     ----------
-    disruption : np.ndarray of shape (N_parcels,)
-        Disruption probability per parcel.
+    disruption : np.ndarray of shape (N_vertices,)
+        Disruption probability per vertex.
     metadata_path : str or Path
-        Path to a JSON file containing parcel metadata.
-        Expected to have a top-level key 'parcels' which is a list of dicts,
-        each with at least 'name' and 'nucleus_target' fields.
+        Path to vertex_metadata.json.
+    projections_path : str or Path
+        Path to vertex_projections.npz (for parcel_labels).
 
     Returns
     -------
     pd.DataFrame
-        Columns: parcel_name, disruption, nucleus_target.
-        Sorted by disruption in descending order.
+        Columns: parcel_name, disruption_mean, disruption_max, n_vertices.
+        Sorted by disruption_mean in descending order.
     """
-    logger.info("Loading parcel metadata: %s", metadata_path)
     meta = load_metadata(metadata_path)
-
-    parcels = meta.get("parcels", [])
-    if len(parcels) != len(disruption):
-        logger.warning(
-            "Parcel count mismatch: metadata has %d parcels, "
-            "disruption array has %d entries. Truncating to the shorter.",
-            len(parcels), len(disruption),
-        )
-        n = min(len(parcels), len(disruption))
-        parcels = parcels[:n]
-        disruption = disruption[:n]
+    vp = load_vertex_projections(projections_path)
+    parcel_labels = vp["parcel_labels"]
 
     rows = []
-    for i, parcel in enumerate(parcels):
+    for parcel_info in meta.get("parcels", []):
+        lbl = parcel_info["label"]
+        name = parcel_info["name"]
+        mask = parcel_labels == lbl
+        n_verts = int(mask.sum())
+
+        if n_verts > 0:
+            d_mean = float(disruption[mask].mean())
+            d_max = float(disruption[mask].max())
+        else:
+            d_mean = 0.0
+            d_max = 0.0
+
         rows.append({
-            "parcel_name": parcel.get("name", f"parcel_{i + 1}"),
-            "disruption": float(disruption[i]),
-            "nucleus_target": parcel.get("nucleus_target", "unknown"),
+            "parcel_name": name,
+            "disruption_mean": d_mean,
+            "disruption_max": d_max,
+            "n_vertices": n_verts,
         })
 
     df = pd.DataFrame(rows)
-    df = df.sort_values("disruption", ascending=False).reset_index(drop=True)
+    df = df.sort_values("disruption_mean", ascending=False).reset_index(drop=True)
 
-    logger.info(
-        "Summary: %d parcels, top disruption = %.4f (%s)",
-        len(df),
-        df["disruption"].iloc[0] if len(df) > 0 else 0.0,
-        df["parcel_name"].iloc[0] if len(df) > 0 else "N/A",
-    )
+    if len(df) > 0:
+        logger.info(
+            "Summary: %d parcels, top disruption = %.4f (%s)",
+            len(df), df["disruption_mean"].iloc[0], df["parcel_name"].iloc[0],
+        )
 
     return df
 
@@ -300,46 +362,31 @@ def run_inference(
     """
     Run lesion inference with one or more aggregation methods.
 
-    Loads the lesion mask, computes disruption for each method, optionally
-    saves disruption volumes and a summary CSV.
-
     Parameters
     ----------
     lesion_path : str or Path
         Path to a binary lesion mask NIfTI in SUIT space.
     output_dir : str or Path, optional
-        Directory for saving outputs. If None, results are returned but
-        not saved to disk.
+        Directory for saving outputs.
     methods : list of str, optional
         Aggregation methods to run. Defaults to all available methods.
 
     Returns
     -------
-    dict mapping method name (str) to disruption array (np.ndarray of shape
-    (N_parcels,)).
+    dict mapping method name to disruption array (N_vertices,).
     """
     lesion_path = Path(lesion_path)
     if methods is None:
         methods = list(VALID_METHODS)
 
-    # Validate requested methods
     for m in methods:
         if m not in VALID_METHODS:
-            raise ValueError(
-                f"Unknown method '{m}'. Choose from: {VALID_METHODS}"
-            )
-
-    occupancy_path = DEFAULT_OCCUPANCY_PATH
-    parcellation_path = DEFAULT_PARCELLATION_PATH
-    reference_path = DEFAULT_REFERENCE_PATH
-    metadata_path = DEFAULT_METADATA_PATH
+            raise ValueError(f"Unknown method '{m}'. Choose from: {VALID_METHODS}")
 
     logger.info("=" * 60)
-    logger.info("Cerebellar Disconnectome Inference")
+    logger.info("Cerebellar Disconnectome Inference (vertex-level)")
     logger.info("=" * 60)
     logger.info("Lesion mask:   %s", lesion_path)
-    logger.info("Occupancy:     %s", occupancy_path)
-    logger.info("Parcellation:  %s", parcellation_path)
     logger.info("Methods:       %s", methods)
 
     results = {}
@@ -347,7 +394,7 @@ def run_inference(
     for method in methods:
         logger.info("-" * 40)
         logger.info("Running method: %s", method)
-        disruption = infer_disruption(lesion_path, occupancy_path, method=method)
+        disruption = infer_disruption(lesion_path, method=method)
         results[method] = disruption
 
     # --- Save outputs if requested ---
@@ -356,35 +403,18 @@ def run_inference(
         output_dir.mkdir(parents=True, exist_ok=True)
         lesion_stem = lesion_path.stem.replace(".nii", "")
 
-        for method, disruption in results.items():
-            # Save disruption volume
-            vol_path = output_dir / f"{lesion_stem}_disruption_{method}.nii.gz"
-            try:
-                img = disruption_to_volume(
-                    disruption, parcellation_path, reference_path,
-                )
-                nib.save(img, str(vol_path))
-                logger.info("Saved disruption volume: %s", vol_path)
-            except FileNotFoundError as exc:
-                logger.warning(
-                    "Could not save disruption volume for '%s': %s", method, exc,
-                )
+        # Save vertex-level disruption arrays (.npz)
+        arrays_dict = {f"disruption_{m}": arr for m, arr in results.items()}
+        npz_path = output_dir / f"{lesion_stem}_vertex_disruption.npz"
+        np.savez_compressed(npz_path, **arrays_dict)
+        logger.info("Saved vertex disruption: %s", npz_path)
 
-        # Save summary CSV (use the first method for the summary, then add all)
+        # Save lobule-level summary CSV
         try:
-            summary_frames = []
             for method, disruption in results.items():
-                df = summarize_disruption(disruption, metadata_path)
-                df = df.rename(columns={"disruption": f"disruption_{method}"})
-                if not summary_frames:
-                    summary_frames.append(df)
-                else:
-                    summary_frames.append(df[[f"disruption_{method}"]])
-
-            if summary_frames:
-                summary_df = pd.concat(summary_frames, axis=1)
-                csv_path = output_dir / f"{lesion_stem}_disruption_summary.csv"
-                summary_df.to_csv(csv_path, index=False, float_format="%.6f")
+                df = summarize_disruption(disruption)
+                csv_path = output_dir / f"{lesion_stem}_summary_{method}.csv"
+                df.to_csv(csv_path, index=False, float_format="%.6f")
                 logger.info("Saved summary CSV: %s", csv_path)
         except FileNotFoundError as exc:
             logger.warning("Could not save summary CSV: %s", exc)

@@ -1,9 +1,14 @@
-# Data files (tracked by Git LFS or not committed)
+# Data files (large raw data, not committed)
 data/raw/hcp/
-*.nii
-*.nii.gz
+data/interim/
 *.trk
 *.tck
+
+# NIfTI files are generally large, but we track the final 4D output via Git LFS
+*.nii
+*.nii.gz
+!data/final/*.nii.gz
+!data/final/*.json
 
 # Python
 __pycache__/

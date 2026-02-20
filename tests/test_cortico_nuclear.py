@@ -126,7 +126,7 @@ class TestNuclearProbabilities:
     Tests that verify the cortico-nuclear mapping produces sensible
     nuclear target probability distributions for different zone locations.
 
-    These tests use the LOBULE_GROUPS table from cortico_nuclear_map to
+    These tests use the LOBULE_GROUP_PROBS table from cortico_nuclear_map to
     check that zone-weighted nuclear probabilities have the expected
     dominant nucleus.
     """
@@ -139,13 +139,13 @@ class TestNuclearProbabilities:
         a midline voxel's zone weights, when applied to the mapping table,
         produce fastigial as the dominant target.
         """
-        from src.cortico_nuclear_map import LOBULE_GROUPS
+        from src.cortico_nuclear_map import LOBULE_GROUP_PROBS
 
         x_mm = np.array([0.0])  # midline = vermis
         zones = classify_zones(x_mm)
 
         # Test across all lobule groups
-        for group_key, group_info in LOBULE_GROUPS.items():
+        for group_key, group_info in LOBULE_GROUP_PROBS.items():
             prob = np.zeros(4)
             for zone_name in ["vermis", "paravermis", "lateral"]:
                 prob += zones[zone_name][0] * np.array(group_info[zone_name])
@@ -163,25 +163,33 @@ class TestNuclearProbabilities:
         """Lateral voxels should have high dentate probability.
 
         For most lobule groups, the lateral row assigns the highest probability
-        to the dentate nucleus (index 3).
+        to the dentate nucleus (index 3).  The flocculonodular lobe is an
+        exception: it projects predominantly to fastigial regardless of zone.
         """
-        from src.cortico_nuclear_map import LOBULE_GROUPS
+        from src.cortico_nuclear_map import LOBULE_GROUP_PROBS
 
         x_mm = np.array([50.0])  # far lateral
         zones = classify_zones(x_mm)
 
-        for group_key, group_info in LOBULE_GROUPS.items():
+        for group_key, group_info in LOBULE_GROUP_PROBS.items():
             prob = np.zeros(4)
             for zone_name in ["vermis", "paravermis", "lateral"]:
                 prob += zones[zone_name][0] * np.array(group_info[zone_name])
 
             prob = prob / prob.sum()
 
-            # Dentate (index 3) should be the dominant nucleus for lateral
-            assert prob[3] == prob.max(), (
-                f"Expected dentate to dominate for lateral in group "
-                f"'{group_key}', got probabilities {prob}"
-            )
+            if group_key == "flocculonodular":
+                # Flocculonodular lobe projects to fastigial even laterally
+                assert prob[0] == prob.max(), (
+                    f"Expected fastigial to dominate for flocculonodular "
+                    f"lateral, got probabilities {prob}"
+                )
+            else:
+                # Dentate (index 3) should be the dominant nucleus for lateral
+                assert prob[3] == prob.max(), (
+                    f"Expected dentate to dominate for lateral in group "
+                    f"'{group_key}', got probabilities {prob}"
+                )
 
     def test_nuclear_probabilities_normalization(self):
         """Nuclear probabilities must sum to 1.0 for any zone mixture.
@@ -189,12 +197,12 @@ class TestNuclearProbabilities:
         We test a range of x coordinates covering vermis through lateral
         and all lobule groups to confirm normalization.
         """
-        from src.cortico_nuclear_map import LOBULE_GROUPS
+        from src.cortico_nuclear_map import LOBULE_GROUP_PROBS
 
         x_values = np.linspace(-40.0, 40.0, 50)
         zones = classify_zones(x_values)
 
-        for group_key, group_info in LOBULE_GROUPS.items():
+        for group_key, group_info in LOBULE_GROUP_PROBS.items():
             for idx in range(len(x_values)):
                 prob = np.zeros(4)
                 for zone_name in ["vermis", "paravermis", "lateral"]:
